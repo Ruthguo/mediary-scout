@@ -251,6 +251,11 @@ export interface TvAnimeTarget {
   seasons: number[];
   /** Missing episode codes, which MAY span the seasons above (e.g. ["S01E07","S02E13"]). */
   missingEpisodes: string[];
+  /** Type-3 can probe for releases ahead of TMDB even when aired need is empty. */
+  providerAheadProbe?: boolean;
+  /** Ground-truth metadata bounds shown to the probe agent; resource titles are
+   *  discovery hints only and real landed files remain the final evidence. */
+  seasonBounds?: Array<{ seasonNumber: number; latestAiredEpisode: number; totalEpisodes?: number }>;
   qualityPreference: string;
 }
 
@@ -289,7 +294,15 @@ export async function runTvAnimeTaskAgent(request: RunTvAnimeRequest): Promise<A
   const { sandbox, model, target, maxSteps, onProgress, apiCallCount, budgetSoftAt, ...promptOptions } = request;
   const seasonsLabel =
     target.seasons.length === 1 ? `season ${target.seasons[0]}` : `seasons ${target.seasons.join(", ")}`;
-  const prompt = `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
+  const aheadProbe = target.providerAheadProbe === true && target.missingEpisodes.length === 0;
+  const bounds = (target.seasonBounds ?? [])
+    .map((bound) => `S${String(bound.seasonNumber).padStart(2, "0")}: TMDB aired through E${String(bound.latestAiredEpisode).padStart(2, "0")}${bound.totalEpisodes === undefined ? "" : `, season total ${bound.totalEpisodes}`}`)
+    .join("; ");
+  const prompt = aheadProbe
+    ? `Probe for provider-ahead episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
+There are NO currently-aired missing episodes. Metadata bounds: ${bounds || "TMDB cursor unavailable"}.
+First inspectTargetDir for every season, then viewResourceSnapshot. Only consider a candidate whose title clearly indicates episodes beyond both the TMDB cursor and the highest episode already in the target directory. If no genuinely newer candidate exists, call finish immediately without transferring anything. If one exists, transfer the fewest reliable candidate(s), inspect the REAL staging files, move only genuinely new in-scope episode files, inspectTargetDir again, markObtained every newly verified SxxExx code, clean staging, then finish. A title such as “更至6集” is discovery evidence only: never move or mark E05/E06 unless those real episode files landed and their filenames identify them. Never exceed the stated season total.`
+    : `Acquire the missing episodes for "${target.title}"${target.aliases.length ? ` (aliases: ${target.aliases.join(", ")})` : ""}, ${seasonsLabel}.
 Missing episodes (the coverage need — may span multiple seasons): ${target.missingEpisodes.join(", ")}.
 If one pack covers multiple seasons, distribute its files in ONE plan with a move per season (moveToSeason({moves:[{season,fileIds}]})) and take only still-missing episodes — never recopy a season already present. Cover every missing episode with the fewest reliable transfers, keep each season directory clean, mark what truly landed, then finish.`;
   return runAcquisitionAgent({

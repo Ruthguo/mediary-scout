@@ -17,6 +17,21 @@ async function sandboxWithNeed(need: string[]) {
   });
 }
 
+async function providerAheadProbeSandbox() {
+  const provider = new FakeResourceProviderV2({ results: {} });
+  const storage = new Storage115Simulator({ packs: {} });
+  const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+  const targetSeasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+  return new TaskSandbox({
+    provider,
+    storage,
+    stagingDirectoryId,
+    targetSeasonDirectoryIds: { 1: targetSeasonDirectoryId },
+    need: [],
+    providerAheadProbe: true,
+  });
+}
+
 describe("TaskSandbox — markObtained (agent's final declaration; NO mechanical reread)", () => {
   it("records the codes the agent declares obtained — pure agent judgment, no fileId", async () => {
     const sandbox = await sandboxWithNeed(["S01E01", "S01E02"]);
@@ -58,6 +73,16 @@ describe("TaskSandbox — markObtained (agent's final declaration; NO mechanical
     const summary = await sandbox.finish();
     expect(summary.obtained).toEqual(all); // ALL 12, not just the aired need
     expect(summary.coverageMet).toBe(true);
+  });
+
+  it("lets an empty-need provider-ahead probe terminate; outer workflow verifies files", async () => {
+    const sandbox = await providerAheadProbeSandbox();
+
+    const result = await sandbox.finish();
+
+    expect(result.coverageMet).toBe(true);
+    expect(result.obtained).toEqual([]);
+    expect(result.missing).toEqual([]);
   });
 
   it("drops a malformed mark so it never reaches syncSeasonNeed's strict parser (Copilot #29)", async () => {

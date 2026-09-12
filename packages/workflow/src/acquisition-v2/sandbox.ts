@@ -12,6 +12,8 @@ import type { SimTreeFile, StorageV2, TransferAttemptResult } from "./storage-11
 import { isSystemicTransferBlockMessage } from "./transfer-block.js";
 import { animeSearchTabooWarnings, type SearchProfile } from "./search-profile.js";
 import type { AuditEvent } from "../domain.js";
+import { episodePartsFromCode } from "../domain.js";
+import { episodeCodeFromFileName } from "../episode-code.js";
 import { isMergedSourceEvidenceUsable, type MergedSourceHealth } from "../resource-source-health.js";
 
 /** Quality / subtitle / source tokens that PanSou share titles almost never carry,
@@ -95,6 +97,13 @@ export interface TaskSandboxOptions {
    *  has a markObtained-confirmed entry. Drives the §3 "no more side effects once
    *  satisfied" gate. The need is just "what's still missing"; sync computes it. */
   need?: string[];
+  /** Type-3 only: the aired need is empty, but the agent is intentionally
+   *  checking for real provider-ahead files. Lets finish() terminate cleanly
+   *  while transfers remain available for a clearly newer candidate. */
+  providerAheadProbe?: boolean;
+  /** Hard physical move bounds for an ahead probe. Every moved video must have
+   *  a parseable code strictly after latestAired and at/below total. */
+  providerAheadBounds?: Record<number, { latestAiredEpisode: number; totalEpisodes?: number }>;
   /** Title + aliases + original title. A search keyword that references NONE of
    *  these is rejected at the tool boundary (the agent's "2026 电影" genre/year
    *  fallback only returns noise). Empty/omitted → no title check (fail open). */
@@ -160,6 +169,8 @@ export class TaskSandbox {
   /** A movie task's one target directory (movies have no seasons). */
   private readonly movieDir: string | undefined;
   private readonly need: readonly string[];
+  private readonly providerAheadProbe: boolean;
+  private readonly providerAheadBounds: TaskSandboxOptions["providerAheadBounds"];
   private readonly titleTerms: readonly string[];
   private readonly subtitleFallback: boolean;
   /** Reserve-zone threshold (movie 8+2) — undefined disables the reserve zone. */
@@ -205,6 +216,8 @@ export class TaskSandbox {
     );
     this.movieDir = options.targetMovieDirectoryId;
     this.need = options.need ?? [];
+    this.providerAheadProbe = options.providerAheadProbe ?? false;
+    this.providerAheadBounds = options.providerAheadBounds;
     this.titleTerms = options.titleTerms ?? [];
     this.subtitleProvider = options.subtitleProvider;
   }
@@ -599,12 +612,40 @@ export class TaskSandbox {
       return { season: move.season, targetDir, fileIds: move.fileIds };
     });
     // Validate ALL fileIds against the current staging snapshot before any move.
-    const stagingIds = new Set(
-      (await this.storage.listTree({ directoryId: this.stagingDirectoryId })).map((file) => file.id),
-    );
+    const stagingFiles = await this.storage.listTree({ directoryId: this.stagingDirectoryId });
+    const stagingById = new Map(stagingFiles.map((file) => [file.id, file]));
+    const stagingIds = new Set(stagingById.keys());
     const outOfScope = resolved.flatMap((move) => move.fileIds).filter((fileId) => !stagingIds.has(fileId));
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
+    }
+    if (this.providerAheadProbe && this.providerAheadBounds) {
+      for (const move of resolved) {
+        if (move.season === undefined) continue;
+        const bound = this.providerAheadBounds[move.season];
+        if (!bound) {
+          throw new Error(`SANDBOX_PROVIDER_AHEAD_NO_BOUND: season ${move.season}`);
+        }
+        for (const fileId of move.fileIds) {
+          const file = stagingById.get(fileId);
+          if (!file?.isVideo) continue; // subtitles ride with their verified video
+          const code = episodeCodeFromFileName(file.path);
+          if (!code) {
+            throw new Error(`SANDBOX_PROVIDER_AHEAD_UNPARSED_VIDEO: ${file.path}`);
+          }
+          const parts = episodePartsFromCode(code);
+          if (
+            parts.seasonNumber !== move.season ||
+            parts.episodeNumber <= bound.latestAiredEpisode ||
+            (bound.totalEpisodes !== undefined && parts.episodeNumber > bound.totalEpisodes)
+          ) {
+            throw new Error(
+              `SANDBOX_PROVIDER_AHEAD_OUT_OF_BOUNDS: ${code} is not within S${String(move.season).padStart(2, "0")} ` +
+                `E${String(bound.latestAiredEpisode + 1).padStart(2, "0")}-${bound.totalEpisodes ?? "?"}`,
+            );
+          }
+        }
+      }
     }
     // Execute each move (the system does the per-file moves under the hood).
     for (const move of resolved) {
@@ -737,7 +778,7 @@ export class TaskSandbox {
         return a < b ? -1 : a > b ? 1 : 0;
       });
     return {
-      coverageMet: this.isCoverageMet(),
+      coverageMet: this.providerAheadProbe || this.isCoverageMet(),
       obtained,
       missing: this.missingNeed(),
       subtitleFallback: this.subtitleFallbackUsed,

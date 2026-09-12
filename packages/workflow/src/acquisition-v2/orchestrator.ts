@@ -117,6 +117,20 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
       ? {}
       : { targetMovieDirectoryId: request.targetMovieDirectoryId }),
     need,
+    ...(request.target.kind === "tv" && request.target.providerAheadProbe
+      ? {
+          providerAheadProbe: true,
+          providerAheadBounds: Object.fromEntries(
+            (request.target.seasonBounds ?? []).map((bound) => [
+              bound.seasonNumber,
+              {
+                latestAiredEpisode: bound.latestAiredEpisode,
+                ...(bound.totalEpisodes === undefined ? {} : { totalEpisodes: bound.totalEpisodes }),
+              },
+            ]),
+          ),
+        }
+      : {}),
     // The agent's search keywords must reference the title — reject genre/year-only
     // fallbacks ("2026 电影") at the tool boundary so they never burn a search.
     titleTerms: [request.target.title, ...request.target.aliases],

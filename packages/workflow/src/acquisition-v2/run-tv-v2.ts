@@ -36,6 +36,8 @@ export interface RunTvAcquisitionV2Request {
   /** 实有 = the DB obtained marks (agent's prior markObtained); empty for a first
    *  acquisition, the type-3 patrol passes the DB obtained codes. */
   priorObtained?: string[];
+  /** Type-3 only: probe PanSou for verified files ahead of the TMDB cursor. */
+  probeProviderAhead?: boolean;
   searchBudget?: number;
   maxSteps?: number;
   preferredLanguage?: string;
@@ -76,12 +78,14 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     seasons: request.seasons.map((season) => ({
       seasonNumber: season.seasonNumber,
       latestAiredEpisode: season.latestAiredEpisode,
+      totalEpisodes: season.totalEpisodes,
     })),
     qualityPreference: request.seasons[0]!.qualityPreference,
     searchHints: getSearchRecipe(profile),
     searchProfile: profile,
     ...(qualityGuidance === "" ? {} : { qualityGuidance }),
     ...(request.priorObtained === undefined ? {} : { priorObtained: request.priorObtained }),
+    ...(request.probeProviderAhead ? { probeProviderAhead: true } : {}),
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
     ...(request.maxSteps === undefined ? {} : { maxSteps: request.maxSteps }),
     ...(request.preferredLanguage === undefined ? {} : { preferredLanguage: request.preferredLanguage }),

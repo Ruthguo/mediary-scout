@@ -207,6 +207,10 @@ export async function runType3MonitoringV2AndPersist(
     workflowRunId: input.workflowRun.id,
     // 实有 = the DB obtained marks; the need is aired − these (NOT a 115 scan).
     priorObtained: input.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
+    // A daily patrol must still look for a release that is ahead of TMDB when
+    // every metadata-aired episode is already present. The agent may discover
+    // from titles, but persistence only follows verified landed filenames.
+    probeProviderAhead: true,
     now,
     onProgress: progressAndTraceSink({
       repository: input.repository,
