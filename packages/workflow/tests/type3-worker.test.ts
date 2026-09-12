@@ -93,6 +93,8 @@ async function seedTrackedSeason(input: {
   title: MediaTitle;
   season: TrackedSeason;
   obtainedCodes: string[];
+  accountId?: string;
+  connectedStorageId?: string;
 }) {
   const files = input.obtainedCodes.map((code, index) =>
     verifiedFile(input.season.storageDirectoryId, `seed_${index}`, code),
@@ -108,6 +110,10 @@ async function seedTrackedSeason(input: {
     files,
   });
   await input.repository.saveWorkflowRunSnapshot({
+    ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
+    ...(input.connectedStorageId === undefined
+      ? {}
+      : { connectedStorageId: input.connectedStorageId }),
     title: input.title,
     season: input.season,
     workflowRun: {
@@ -301,6 +307,78 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     });
 
     expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_active" }]);
+  });
+
+  it("isolates an unavailable drive and continues patrolling other tracked items", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const orphan = trackedFixture("orphan");
+    const healthy = trackedFixture("healthy");
+    await seedTrackedSeason({
+      repository,
+      ...orphan,
+      obtainedCodes: [],
+      accountId: "acct_orphan",
+      connectedStorageId: "removed_drive",
+    });
+    await seedTrackedSeason({
+      repository,
+      ...healthy,
+      obtainedCodes: [],
+      accountId: "acct_healthy",
+      connectedStorageId: "healthy_drive",
+    });
+    await repository.saveWorkflowRunSnapshot({
+      accountId: "acct_healthy",
+      connectedStorageId: "healthy_drive",
+      title: healthy.title,
+      season: healthy.season,
+      workflowRun: {
+        id: "active_healthy_run",
+        kind: "type3_monitor",
+        status: "running",
+        trackedSeasonId: healthy.season.id,
+        startedAt: fixedNow(),
+        finishedAt: null,
+        auditEvents: [],
+      },
+      episodes: createEpisodeStates({
+        trackedSeasonId: healthy.season.id,
+        seasonNumber: healthy.season.seasonNumber,
+        totalEpisodes: healthy.season.totalEpisodes,
+        latestAiredEpisode: healthy.season.latestAiredEpisode,
+      }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      resolveAccountContext: async (_accountId, connectedStorageId) => {
+        if (connectedStorageId === "removed_drive") {
+          throw new Error("CONNECTED_STORAGE_UNAVAILABLE: removed_drive");
+        }
+        return {};
+      },
+    });
+
+    expect(outcomes).toHaveLength(2);
+    expect(outcomes).toEqual(
+      expect.arrayContaining([
+        {
+          trackedSeasonId: orphan.season.id,
+          status: "skipped_unavailable_storage",
+          errorMessage: "CONNECTED_STORAGE_UNAVAILABLE: removed_drive",
+        },
+        { trackedSeasonId: healthy.season.id, status: "skipped_active" },
+      ]),
+    );
   });
 
   it("patrols a tracked-but-unobtained movie by dispatching the movie agent (by title.type)", async () => {

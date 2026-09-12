@@ -387,6 +387,11 @@ export type ScheduledType3Outcome =
     }
   | {
       trackedSeasonId: string;
+      status: "skipped_unavailable_storage";
+      errorMessage: string;
+    }
+  | {
+      trackedSeasonId: string;
       status: "ran";
       workflowRunId: string;
       workflowStatus: WorkflowStatus;
@@ -434,12 +439,25 @@ export async function runScheduledType3Monitoring(input: {
   const trackedStates = await input.repository.listAllTrackedSeasonStates();
 
   for (const state of trackedStates) {
-    const deps = await resolveWorkerDeps(
-      input.resolveAccountContext,
-      state.accountId,
-      state.connectedStorageId,
-      input,
-    );
+    let deps: Awaited<ReturnType<typeof resolveWorkerDeps>>;
+    try {
+      deps = await resolveWorkerDeps(
+        input.resolveAccountContext,
+        state.accountId,
+        state.connectedStorageId,
+        input,
+      );
+    } catch (error) {
+      // An unbound/orphaned drive belongs to this tracked item only. Keep the
+      // sweep cross-drive: surface the skipped item and continue with every
+      // still-connected storage instead of aborting the whole daily patrol.
+      outcomes.push({
+        trackedSeasonId: state.season.id,
+        status: "skipped_unavailable_storage",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
     // Patrol dispatches by title.type: a film needs the MOVIE agent, not the
     // TV/anime agent (different semantics). (未上映/reserved films aren't tracked
     // yet; the air-time gate lands with that product state.)
