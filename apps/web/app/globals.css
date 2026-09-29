@@ -622,6 +622,18 @@ p {
   border-radius: var(--radius-pill);
 }
 
+.book-actions .book-action-message {
+  flex: 0 0 100%;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.book-actions .book-action-message.is-error {
+  color: var(--negative);
+}
+
 .book-detail-actions {
   display: flex;
   align-items: center;
