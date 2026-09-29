@@ -622,6 +622,28 @@ p {
   border-radius: var(--radius-pill);
 }
 
+.book-detail-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.book-detail-actions .book-transfer-action {
+  margin: 0;
+}
+
+.book-source-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: var(--radius-pill);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
 .book-transfer-action span {
   color: var(--text-muted);
   font-size: 12px;
