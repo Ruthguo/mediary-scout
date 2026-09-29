@@ -27,7 +27,7 @@ export function BookTransferButton({
         : null,
   );
   if (result?.status === "saved") {
-    return <div className="request-track book-actions"><span className="hub-badge tone-green"><Check size={12} aria-hidden />已获取</span><button className="secondary-button" type="button" onClick={() => startTransition(async () => { await untrackBookAction({ bookId, storageId }); router.refresh(); })}>取消追踪</button></div>;
+    return <div className="request-track book-actions"><span className="hub-badge tone-green"><Check size={12} aria-hidden />已获取</span><button className="secondary-button" type="button" disabled={pending} onClick={() => startTransition(async () => { try { const response = await untrackBookAction({ bookId, storageId }); if (response.status === "untracked") { router.push(`${storageId ? `/w/${encodeURIComponent(storageId)}` : "/"}?tab=library&type=book`); } else { setResult({ status: "failed", message: response.message }); } } catch (error) { setResult({ status: "failed", message: error instanceof Error ? error.message : "取消追踪失败，请刷新后重试。" }); } })}>取消追踪</button>{result.status === "failed" ? <span role="alert">{result.message}</span> : null}</div>;
   }
   return (
     <div className="request-track book-actions">

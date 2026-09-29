@@ -67,7 +67,6 @@ export async function untrackBookAction(input: { bookId: string; storageId?: str
   const scope = await getActiveWorkspaceScope(input.storageId);
   const removed = await getWorkflowRepository().deleteBookEntry(input.bookId, scope);
   revalidatePath("/");
-  revalidatePath(`/book/${input.bookId}`);
   return removed
     ? { status: "untracked", message: "已取消追踪（网盘文件已保留）。" }
     : { status: "not_found", message: "这本书未在当前网盘追踪。" };
