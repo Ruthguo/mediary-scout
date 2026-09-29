@@ -8,6 +8,7 @@ import { AcquireProgressBadge } from "../components/acquire-progress-badge";
 import { DemoSessionLibrary } from "../components/demo-session-library";
 import { RememberQuery } from "../components/search-memory";
 import { SearchForm } from "../components/search-form";
+import { BookTransferButton } from "../components/book-transfer-button";
 import { SeasonRequestMenu } from "../components/season-request-menu";
 import { TrendingRow } from "../components/trending-row";
 import { ConnectNoticeBanner } from "../components/connect-notice-banner";
@@ -204,7 +205,7 @@ async function BookSearchResults({ query, storageId }: { query: string; storageI
                 <h3><Link href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>{book.title}</Link></h3>
                 <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""}</p>
                 {savedById.has(book.id) ? <p>{savedById.get(book.id)?.status === "saved" ? "已入库" : "转存处理中"}</p> : null}
-                <Link className="primary-button" href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>查看书籍</Link>
+                <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} />
               </div>
             </article>
           ))}

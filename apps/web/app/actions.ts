@@ -5,23 +5,24 @@ import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "
 import { assertNotDemo } from "../lib/demo-mode";
 import { searchBookLinks } from "../lib/book-search";
 import { getBookMetadata, searchBooks } from "../lib/book-metadata";
+import { allowedResourceTypesForKinds, getStorageBrand, isRegisteredStorageProvider } from "@media-track/workflow";
 
-export async function transferBookAction(input: {
+export async function requestBookAction(input: {
   query: string;
-  url: string;
   bookId: string;
   storageId?: string | undefined;
-}): Promise<{ status: "saved" | "pending" | "unsupported" | "failed"; message: string }> {
+}): Promise<{ status: "saved" | "pending" | "unsupported" | "failed" | "no_coverage"; message: string }> {
   assertNotDemo();
-  const { requireAuthenticatedAccountId, transferBookResource } = await import("../lib/workflow-runtime");
+  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope, selectBookResource, transferBookResource } = await import("../lib/workflow-runtime");
   await requireAuthenticatedAccountId();
   const query = input.query.trim();
-  if (!query || query.length > 120 || input.url.length > 2048) {
+  if (!query || query.length > 120) {
     return { status: "unsupported", message: "搜索内容无效，请重新搜索。" };
   }
-  // Re-fetch on the server so a caller cannot submit an arbitrary URL to a
-  // privileged drive executor. The selected URL must be in this account's
-  // current PanSou result set.
+  const scope = await getActiveWorkspaceScope(input.storageId);
+  const repository = getWorkflowRepository();
+  const previous = await repository.getBookEntry(input.bookId, scope);
+  if (previous?.status === "saved") return { status: "saved", message: "这本书已入库。" };
   let book;
   try {
     book = await getBookMetadata(input.bookId, query) ?? (await searchBooks(query)).find((entry) => entry.id === input.bookId) ?? null;
@@ -29,10 +30,23 @@ export async function transferBookAction(input: {
     return { status: "failed", message: "书籍资料暂时不可用，请稍后重试。" };
   }
   if (!book) return { status: "unsupported", message: "书籍条目已更新，请重新搜索。" };
+  const configError = await acquireLlmPreflightError(scope.accountId);
+  if (configError) return { status: "unsupported", message: configError };
   const result = await searchBookLinks(book.title);
-  const link = result.links.find((entry) => entry.url === input.url);
-  if (!link) return { status: "unsupported", message: "资源已失效，请重新搜索。" };
+  if (result.status === "unreachable" || result.status === "protocol_error") {
+    return { status: "failed", message: "资源搜索源暂时不可用，请稍后重试。" };
+  }
+  const drive = (await repository.listConnectedStorages(scope.accountId)).find((item) => item.id === scope.connectedStorageId);
+  if (!drive || !isRegisteredStorageProvider(drive.provider)) {
+    return { status: "unsupported", message: "请先连接网盘。" };
+  }
+  const allowed = new Set(allowedResourceTypesForKinds(getStorageBrand(drive.provider).resourceProviderKinds));
+  const candidates = result.links.filter((link) => link.type !== "magnet" && allowed.has(link.type)).slice(0, 40);
+  if (candidates.length === 0) return { status: "no_coverage", message: "暂未找到这本书的资源。" };
   try {
+    const selected = await selectBookResource({ book, candidates });
+    if (selected === null) return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
+    const link = candidates[selected]!;
     const saved = await transferBookResource({ ...link, book, query: book.title, storageId: input.storageId });
     revalidatePath("/");
     revalidatePath(`/book/${book.id}`);

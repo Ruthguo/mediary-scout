@@ -1,17 +1,15 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { LoaderCircle } from "lucide-react";
-import { transferBookAction } from "../app/actions";
+import { LoaderCircle, Plus } from "lucide-react";
+import { requestBookAction } from "../app/actions";
 
 export function BookTransferButton({
   query,
-  url,
   bookId,
   storageId,
 }: {
   query: string;
-  url: string;
   bookId: string;
   storageId?: string | undefined;
 }) {
@@ -25,14 +23,14 @@ export function BookTransferButton({
         disabled={pending || result?.status === "saved" || result?.status === "pending"}
         onClick={() => startTransition(async () => {
           try {
-            setResult(await transferBookAction({ query, url, bookId, storageId }));
+            setResult(await requestBookAction({ query, bookId, storageId }));
           } catch (error) {
             setResult({ status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" });
           }
         })}
       >
-        {pending ? <LoaderCircle size={16} className="spin" aria-hidden /> : null}
-        {pending ? "转存中" : result?.status === "saved" ? "已转存" : result?.status === "pending" ? "已提交" : "转存到网盘"}
+        {pending ? <LoaderCircle size={16} className="spin" aria-hidden /> : <Plus size={16} aria-hidden />}
+        {pending ? "获取中" : result?.status === "saved" ? "已获取" : result?.status === "pending" ? "已提交" : "获取"}
       </button>
       {result ? <span role={result.status === "failed" ? "alert" : "status"}>{result.message}</span> : null}
     </div>

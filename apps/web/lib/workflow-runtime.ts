@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { isAgentMemoryEnabled } from "./agent-memory-server";
 import { cache } from "react";
+import { generateText } from "ai";
 import {
   checkLoginAllowed,
   recordLoginFailure,
@@ -2589,6 +2590,30 @@ export async function transferBookResource(input: {
     return { status: "saved", message: `已转存到 Books/${folderName}（${files.length} 个文件）。` };
   }
   return { status: "pending", message: `网盘已接收转存请求，请稍后查看 Books/${folderName}。` };
+}
+
+/** Book decisions use the account's configured acquisition model. The model sees
+ * resource labels, never raw URLs; its selected index is checked against the
+ * server-side candidate list before any privileged transfer. */
+export async function selectBookResource(input: {
+  book: BookTitle;
+  candidates: Array<{ title: string; type: ResourceType; source: string }>;
+}): Promise<number | null> {
+  const accountId = await requireAuthenticatedAccountId();
+  const { model } = await getAgentModel(getAccountScopedSettings(accountId));
+  const rows = input.candidates.slice(0, 40).map((candidate, index) =>
+    `${index + 1}. [${candidate.type}] ${candidate.title} (${candidate.source})`,
+  );
+  if (rows.length === 0) return null;
+  const result = await generateText({
+    model,
+    system: "你是书籍资源筛选 agent。先核对作品书名、作者，再判断候选是否为电子书，而非同名电影、电视剧、短剧或有声书。优先 EPUB、AZW3、MOBI、PDF、TXT。标题证据不足时回答 NONE。只输出一个候选序号或 NONE，不要解释。",
+    prompt: `目标书籍：${input.book.title}\n作者：${input.book.authors.join("、") || "未知"}\n候选：\n${rows.join("\n")}`,
+  });
+  const answer = result.text.trim();
+  if (!/^\d+$/.test(answer)) return null;
+  const index = Number(answer) - 1;
+  return Number.isSafeInteger(index) && index >= 0 && index < rows.length ? index : null;
 }
 
 /** Reconcile an asynchronous share save when its detail page is opened later. */
