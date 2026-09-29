@@ -33,13 +33,13 @@ function bookLink(candidate: ResourceCandidate): BookLink | null {
   };
 }
 
-/** PanSou is a general media index and may return unrelated short dramas for a
- *  book query. Only expose results naming the work AND an ebook format/label. */
+/** PanSou is a general media index. Keep title matches here; the acquisition
+ * agent decides whether a candidate is a real book resource. */
 export function isBookResourceTitle(candidateTitle: string, bookTitle: string): boolean {
   const name = normalizeTitleForContainment(bookTitle);
   const candidate = normalizeTitleForContainment(candidateTitle);
   if (name.length < 2 || !candidate.includes(name)) return false;
-  return /(?:epub|mobi|azw3?|pdf|djvu|fb2|电子书|电子版|图书|书籍|小说|kindle)/i.test(candidateTitle);
+  return true;
 }
 
 export async function searchBookLinks(query: string): Promise<BookSearchResult> {

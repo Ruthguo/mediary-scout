@@ -4,7 +4,7 @@ import { revalidatePath } from "next/cache";
 import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "../lib/workflow-runtime";
 import { assertNotDemo } from "../lib/demo-mode";
 import { searchBookLinks } from "../lib/book-search";
-import { getBookMetadata } from "../lib/book-metadata";
+import { getBookMetadata, searchBooks } from "../lib/book-metadata";
 
 export async function transferBookAction(input: {
   query: string;
@@ -24,7 +24,7 @@ export async function transferBookAction(input: {
   // current PanSou result set.
   let book;
   try {
-    book = await getBookMetadata(input.bookId);
+    book = await getBookMetadata(input.bookId, query) ?? (await searchBooks(query)).find((entry) => entry.id === input.bookId) ?? null;
   } catch {
     return { status: "failed", message: "书籍资料暂时不可用，请稍后重试。" };
   }

@@ -1,72 +1,58 @@
 import type { BookTitle } from "@media-track/workflow";
 
-const SEARCH_BASE = "https://openlibrary.org/search.json";
-const WORK_BASE = "https://openlibrary.org/works";
-const ID_PATTERN = /^OL\d+W$/;
-const searchCache = new Map<string, { expiresAt: number; books: BookTitle[] }>();
+const SEARCH_URL = "https://book.douban.com/j/subject_suggest";
+const cache = new Map<string, { expiresAt: number; books: BookTitle[] }>();
 
-interface OpenLibraryDoc {
-  key?: unknown;
-  title?: unknown;
-  author_name?: unknown;
-  first_publish_year?: unknown;
-  cover_i?: unknown;
-}
+interface DoubanBook { id?: unknown; title?: unknown; url?: unknown; pic?: unknown; author_name?: unknown; year?: unknown }
+function stringValue(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
 
-function text(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function bookFromDoc(doc: OpenLibraryDoc): BookTitle | null {
-  const id = text(doc.key).replace(/^\/works\//, "");
-  const title = text(doc.title);
-  if (!ID_PATTERN.test(id) || !title) return null;
+function mapBook(row: DoubanBook): BookTitle | null {
+  const id = stringValue(row.id);
+  const title = stringValue(row.title);
+  if (!/^\d+$/.test(id) || !title) return null;
   return {
-    id,
+    id: `douban_${id}`,
     title,
-    authors: Array.isArray(doc.author_name) ? doc.author_name.map(text).filter(Boolean).slice(0, 4) : [],
-    year: typeof doc.first_publish_year === "number" ? doc.first_publish_year : null,
-    coverUrl: typeof doc.cover_i === "number" ? `https://covers.openlibrary.org/b/id/${doc.cover_i}-M.jpg` : null,
+    authors: stringValue(row.author_name).split(/[、,/]/).map((author) => author.trim()).filter(Boolean).slice(0, 5),
+    year: /^\d{4}$/.test(stringValue(row.year)) ? Number(row.year) : null,
+    coverUrl: stringValue(row.pic) || null,
     description: "",
-    sourceUrl: `${WORK_BASE}/${id}`,
+    sourceUrl: stringValue(row.url) || `https://book.douban.com/subject/${id}/`,
   };
 }
 
 export async function searchBooks(query: string): Promise<BookTitle[]> {
   const keyword = query.trim().slice(0, 120);
   if (!keyword) return [];
-  const cacheKey = keyword.toLowerCase();
-  const cached = searchCache.get(cacheKey);
+  const key = keyword.toLowerCase();
+  const cached = cache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.books;
-  const url = new URL(SEARCH_BASE);
-  url.searchParams.set(Array.from(keyword).length < 3 ? "title" : "q", keyword);
-  url.searchParams.set("limit", "20");
-  url.searchParams.set("fields", "key,title,author_name,first_publish_year,cover_i");
-  const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`Open Library search HTTP ${response.status}`);
-  const body = await response.json() as { docs?: OpenLibraryDoc[] };
-  const books = (Array.isArray(body.docs) ? body.docs : []).map(bookFromDoc).filter((book): book is BookTitle => book !== null);
-  searchCache.set(cacheKey, { expiresAt: Date.now() + 6 * 60 * 60 * 1000, books });
-  return books;
-}
-
-export async function getBookMetadata(id: string): Promise<BookTitle | null> {
-  if (!ID_PATTERN.test(id)) return null;
-  const response = await fetch(`${WORK_BASE}/${id}.json`, { signal: AbortSignal.timeout(10_000), next: { revalidate: 21600 } });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Open Library work HTTP ${response.status}`);
-  const work = await response.json() as Record<string, unknown>;
-  const title = text(work.title);
-  if (!title) return null;
-  const cover = Array.isArray(work.covers) && typeof work.covers[0] === "number" ? work.covers[0] : null;
-  const rawDescription = work.description;
-  return {
-    id,
-    title,
+  const url = new URL(SEARCH_URL);
+  url.searchParams.set("q", keyword);
+  const response = await fetch(url, { signal: AbortSignal.timeout(10_000), headers: { Accept: "application/json", "User-Agent": "MediaryScout/1.0" } });
+  if (!response.ok) throw new Error(`Douban book search HTTP ${response.status}`);
+  const body = await response.json() as unknown;
+  const books = Array.isArray(body)
+    ? body.map((row) => (row && typeof row === "object" ? mapBook(row as DoubanBook) : null)).filter((book): book is BookTitle => book !== null)
+    : [];
+  const result = books.length > 0 ? books : [{
+    id: `query_${encodeURIComponent(keyword)}`,
+    title: keyword,
     authors: [],
     year: null,
-    coverUrl: cover ? `https://covers.openlibrary.org/b/id/${cover}-M.jpg` : null,
-    description: text(typeof rawDescription === "object" && rawDescription !== null ? (rawDescription as { value?: unknown }).value : rawDescription),
-    sourceUrl: `${WORK_BASE}/${id}`,
-  };
+    coverUrl: null,
+    description: "",
+    sourceUrl: "",
+  }];
+  cache.set(key, { expiresAt: Date.now() + 6 * 60 * 60 * 1000, books: result });
+  return result;
+}
+
+export async function getBookMetadata(id: string, query?: string): Promise<BookTitle | null> {
+  if (id.startsWith("query_") && query?.trim()) {
+    const title = decodeURIComponent(id.slice("query_".length));
+    return { id, title, authors: [], year: null, coverUrl: null, description: "", sourceUrl: "" };
+  }
+  if (!/^douban_\d+$/.test(id) || !query?.trim()) return null;
+  return (await searchBooks(query)).find((book) => book.id === id) ?? null;
 }

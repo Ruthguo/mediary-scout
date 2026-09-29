@@ -27,7 +27,7 @@ async function BookContent({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const [{ bookId }, values] = await Promise.all([params, searchParams]);
-  if (!/^OL\d+W$/.test(bookId)) notFound();
+  if (!/^douban_\d+$/.test(bookId)) notFound();
   const storageId = typeof values.w === "string" ? values.w : undefined;
   const scope = await getActiveWorkspaceScope(storageId);
   const repository = getWorkflowRepository();
@@ -38,7 +38,7 @@ async function BookContent({
     try { book = (await searchBooks(query)).find((item) => item.id === bookId) ?? null; } catch { /* detail fallback below */ }
   }
   if (!book) {
-    try { book = await getBookMetadata(bookId); } catch { /* show unavailable state */ }
+    try { book = await getBookMetadata(bookId, query); } catch { /* show unavailable state */ }
   }
   if (!book) notFound();
 
