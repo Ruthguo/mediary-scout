@@ -2603,8 +2603,8 @@ export async function transferBookResource(input: {
     return { status: "failed", message: attempt.providerMessage || "网盘转存失败。" };
   }
   const files = await executor.listTree({ directoryId: targetDir });
-  const ebookFiles = files.filter((file) => /\.(epub|azw3?|mobi|txt|pdf|cbz|cbr)$/i.test(file.name));
-  const archiveOnly = files.length > 0 && ebookFiles.length === 0 && files.every((file) => /\.(zip|7z|rar|tar|gz)$/i.test(file.name));
+  const ebookFiles = files.filter((file) => /\.(epub|azw3?|mobi|txt|pdf|cbz|cbr)$/i.test(file.path));
+  const archiveOnly = files.length > 0 && ebookFiles.length === 0 && files.every((file) => /\.(zip|7z|rar|tar|gz)$/i.test(file.path));
   await repository.saveBookEntry({
     book: input.book,
     accountId,
