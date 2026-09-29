@@ -135,6 +135,27 @@ describe("raw snapshot pre-warming", () => {
     const lines = snap.document.split("\n").filter(line => line.match(/\[c\d+\]/));
     expect(lines.length).toBeLessThanOrEqual(120);
   });
+
+  it("shows title matches hidden deep in PanSou results and pages through the rest", async () => {
+    const titles = Array.from({ length: 150 }, (_, i) => `Unrelated documentary ${i}`);
+    titles[143] = "生命奇观（2024）4K HDR S01E01";
+    titles[149] = "生命奇观";
+    const sandbox = await createTestSandbox(titles, "生命奇观", { scores: { c143: 0.52 } });
+    await sandbox.primeRawSnapshot("生命奇观");
+
+    const first = sandbox.viewResourceSnapshot();
+    expect(first.candidateCount).toBe(150);
+    expect(first.document).toContain("[c143] 生命奇观（2024）4K HDR S01E01 ⚠ 相关度存疑(0.52)");
+    expect(first.document).toContain("[c149] 生命奇观");
+    expect(first.document.indexOf("[c143]")).toBeLessThan(first.document.indexOf("[c0]"));
+    expect(first.document).toContain(JEV_UNCERTAIN_LEGEND);
+    expect(first.document).toContain("viewResourceSnapshot({offset:120})");
+
+    const second = sandbox.viewResourceSnapshot({ offset: 120 });
+    expect(second.document).toContain("[c148] Unrelated documentary 148");
+    expect(second.document).not.toContain("[c143]");
+    expect(second.document).not.toContain(JEV_UNCERTAIN_LEGEND);
+  });
 });
 
 describe("system prompt carries raw snapshot pointer", () => {

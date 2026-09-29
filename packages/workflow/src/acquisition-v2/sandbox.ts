@@ -97,7 +97,7 @@ const JEV_FLAGS_SUPPRESSED_NOTE =
  *  the 活期文档), the raw score map stripped (the agent judges titles, not numbers).
  *  Both read paths (searchResources and viewResourceSnapshot) go through here so the
  *  agent can never see two different stories about the same candidates. */
-function presentSnapshotForAgent(snapshot: ResourceSnapshotV2, limit?: number): {
+function presentSnapshotForAgent(snapshot: ResourceSnapshotV2, limit?: number, offset = 0): {
   snapshot: ResourceSnapshotV2;
   legend: string | undefined;
   allDroppedWarning: string | undefined;
@@ -114,7 +114,7 @@ function presentSnapshotForAgent(snapshot: ResourceSnapshotV2, limit?: number): 
   // flags are dropped and one line says why.
   const flags = snapshot.candidates.map((c) => jevUncertaintyFlag(scores[c.id]));
   // Judged on the rows the agent will actually see (viewResourceSnapshot cuts at `limit`).
-  const shown = limit === undefined ? flags : flags.slice(0, limit);
+  const shown = limit === undefined ? flags : flags.slice(offset, offset + limit);
   const shownFlagged = shown.filter((flag) => flag !== "").length;
   if (shown.length >= JEV_FLAG_NOISE_MIN_ROWS && shownFlagged > shown.length / 2) {
     const { prefilterScores: _scores, prefilterDropped: _dropped, ...rest } = snapshot;
@@ -123,7 +123,7 @@ function presentSnapshotForAgent(snapshot: ResourceSnapshotV2, limit?: number): 
   let flagged = 0;
   const candidates = snapshot.candidates.map((c, index) => {
     const flag = flags[index]!;
-    if (flag && (limit === undefined || index < limit)) flagged += 1;
+    if (flag && (limit === undefined || (index >= offset && index < offset + limit))) flagged += 1;
     return flag ? { ...c, title: `${c.title}${flag}` } : c;
   });
   // Both prefilter fields are stripped: the agent judges titles, not numbers, and the
@@ -2047,11 +2047,9 @@ export class TaskSandbox {
     this.rawSnapshot = snapshot;
   }
 
-  /** Read-only tool: view the pre-warmed raw snapshot as a structured document.
-   *  Free, repeatable, does NOT consume search budget. Each row is id + title,
-   *  plus · 发布 YYYY-MM-DD when postedAt is known, then · 近 30 天转过… when
-   *  linkHistory is set (truncated at 120 if excessive). */
-  viewResourceSnapshot(): { document: string; candidateCount: number } {
+  /** Read-only paged view of the pre-warmed raw snapshot. Show titles containing
+   *  the bare term first, then the other candidates in their original order. */
+  viewResourceSnapshot(options: { offset?: number } = {}): { document: string; candidateCount: number } {
     if (!this.rawSnapshot) {
       return {
         document: "No raw snapshot available. Call primeRawSnapshot first.",
@@ -2063,22 +2061,31 @@ export class TaskSandbox {
     // or a drop-band row the containment floor kept because its title contains the
     // target's name. Kept and flagged so the agent looks twice.
     // Same presenter as searchResources: one story, two read paths.
-    const view = presentSnapshotForAgent(this.rawSnapshot, RAW_SNAPSHOT_ROW_LIMIT);
-    const candidates = view.snapshot.candidates;
-    const total = candidates.length;
-    const truncated = candidates.slice(0, RAW_SNAPSHOT_ROW_LIMIT);
-    const remaining = total - truncated.length;
+    const rawCandidates = this.rawSnapshot.candidates;
+    const total = rawCandidates.length;
+    const searchTerm = this.rawSnapshot.keyword.normalize("NFKC").toLocaleLowerCase().trim();
+    const matches = searchTerm
+      ? rawCandidates.filter((candidate) => candidate.title.normalize("NFKC").toLocaleLowerCase().includes(searchTerm))
+      : [];
+    const matchedIds = new Set(matches.map((candidate) => candidate.id));
+    const ranked = [...matches, ...rawCandidates.filter((candidate) => !matchedIds.has(candidate.id))];
+    const offset = Math.min(options.offset ?? 0, total);
+    const view = presentSnapshotForAgent(
+      { ...this.rawSnapshot, candidates: ranked }, RAW_SNAPSHOT_ROW_LIMIT, offset,
+    );
+    const page = view.snapshot.candidates.slice(offset, offset + RAW_SNAPSHOT_ROW_LIMIT);
+    const remaining = total - offset - page.length;
 
-    let document = `📋 Raw snapshot (${total} candidates):\n\n`;
+    let document = `📋 Raw snapshot (${total} candidates; ${matches.length} title matches; showing ${page.length ? offset + 1 : 0}-${offset + page.length}):\n\n`;
 
-    for (const candidate of truncated) {
+    for (const candidate of page) {
       const posted = candidate.postedAt ? ` · 发布 ${candidate.postedAt}` : "";
       const history = candidate.linkHistory ? ` · ${candidate.linkHistory}` : "";
       document += `[${candidate.id}] ${candidate.title}${posted}${history}\n`;
     }
 
     if (remaining > 0) {
-      document += `\n... 还有 ${remaining} 条。如需更多,可用 searchResources 搜繁体/英文关键词。\n`;
+      document += `\n... 还有 ${remaining} 条。调用 viewResourceSnapshot({offset:${offset + page.length}}) 查看下一页，不耗搜索预算。\n`;
     }
     if (view.legend) document += `\n${view.legend}\n`;
     if (view.allDroppedWarning) document += `\n${view.allDroppedWarning}\n`;
