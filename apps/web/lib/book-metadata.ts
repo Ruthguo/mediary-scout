@@ -40,7 +40,7 @@ export async function searchBooks(query: string): Promise<BookTitle[]> {
     try {
       const html = await fetch(book.sourceUrl, { signal: AbortSignal.timeout(8_000), headers: { Accept: "text/html", "User-Agent": "MediaryScout/1.0" } }).then((response) => response.ok ? response.text() : "");
       const document = load(html);
-      const description = document("#link-report .intro").first().text(" ").replace(/\s+/g, " ").trim();
+      const description = document("#link-report .intro").first().text().replace(/\s+/g, " ").trim();
       return description ? { ...book, description: description.slice(0, 900) } : book;
     } catch {
       return book;
