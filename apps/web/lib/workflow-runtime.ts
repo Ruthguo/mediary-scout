@@ -2631,13 +2631,23 @@ export async function selectBookResource(input: {
   if (rows.length === 0) return null;
   const result = await generateText({
     model,
-    system: "你是书籍资源筛选 agent。先核对作品书名、作者，再判断候选是否为电子书，而非同名电影、电视剧、短剧或有声书。优先 EPUB、AZW3、MOBI、PDF、TXT。标题证据不足时回答 NONE。只输出一个候选序号或 NONE，不要解释。",
+    system: [
+      "你是 Mediary Scout 的书籍资源筛选 agent。你的任务是从候选中选出一个最可能是目标书籍的电子书资源。",
+      "先核对书名，再用作者、译者、ISBN、出版年份作为辅助证据；不要选择明显是另一部作品的同名资源。",
+      "排除电影、电视剧、动漫、短剧、纪录片、课程、讲义、音乐、播客、有声书、听书、朗读和纯音频资源。",
+      "只接受电子书文件或明确的电子书合集。格式优先级严格为：EPUB > AZW3 > MOBI > TXT > PDF。也可接受明确标注为电子书、精校文字版或 Kindle 版的资源。",
+      "如果同一本书有多个可接受格式，选择优先级最高的格式；如果只有 PDF，PDF 是正常结果，不要因此返回 NONE。",
+      "只有所有候选都无法确认是目标书籍电子书时，才返回 NONE。",
+      "只输出一个候选序号或 NONE，不要输出解释、Markdown 或其他文字。",
+    ].join("\n"),
     prompt: `目标书籍：${input.book.title}\n作者：${input.book.authors.join("、") || "未知"}\n候选：\n${rows.join("\n")}`,
   });
   const answer = result.text.trim();
   if (/^\d+$/.test(answer)) {
     const index = Number(answer) - 1;
-    if (Number.isSafeInteger(index) && index >= 0 && index < rows.length) return index;
+    if (Number.isSafeInteger(index) && index >= 0 && index < rows.length) {
+      return index;
+    }
   }
   // Models sometimes over-conservatively answer NONE for Chinese titles. Keep
   // acquisition deterministic: choose the first candidate whose title carries
