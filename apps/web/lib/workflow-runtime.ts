@@ -2571,6 +2571,18 @@ export async function transferBookResource(input: {
     source: "pansou",
     providerPayload: { url: input.url, password: input.password },
   };
+  // Persist the pending book before the provider call so the activity page can
+  // show the same in-progress state as a movie acquisition.
+  await repository.saveBookEntry({
+    book: input.book,
+    accountId,
+    connectedStorageId: choice.id,
+    status: "pending",
+    directoryId: targetDir,
+    directoryPath: `Books/${folderName}`,
+    fileCount: 0,
+    updatedAt: new Date().toISOString(),
+  });
   const attempt = await executor.transfer({ workflowRunId: runId, directoryId: targetDir, candidate });
   if (attempt.status === "failed") {
     return { status: "failed", message: attempt.providerMessage || "网盘转存失败。" };
@@ -2611,9 +2623,16 @@ export async function selectBookResource(input: {
     prompt: `目标书籍：${input.book.title}\n作者：${input.book.authors.join("、") || "未知"}\n候选：\n${rows.join("\n")}`,
   });
   const answer = result.text.trim();
-  if (!/^\d+$/.test(answer)) return null;
-  const index = Number(answer) - 1;
-  return Number.isSafeInteger(index) && index >= 0 && index < rows.length ? index : null;
+  if (/^\d+$/.test(answer)) {
+    const index = Number(answer) - 1;
+    if (Number.isSafeInteger(index) && index >= 0 && index < rows.length) return index;
+  }
+  // Models sometimes over-conservatively answer NONE for Chinese titles. Keep
+  // acquisition deterministic: choose the first candidate whose title carries
+  // an ebook extension or an explicit ebook format marker.
+  const ebook = /\.(epub|azw3?|mobi|pdf|txt|cbz|cbr)(?:$|[\s._-])|\b(epub|azw3?|mobi|电子书|精校|文字版)\b/i;
+  const fallback = input.candidates.findIndex((candidate) => ebook.test(candidate.title));
+  return fallback >= 0 ? fallback : null;
 }
 
 /** Reconcile an asynchronous share save when its detail page is opened later. */

@@ -202,10 +202,18 @@ async function BookSearchResults({ query, storageId }: { query: string; storageI
                 ) : <BookOpen size={28} aria-hidden />}
               </Link>
               <div className="candidate-body">
-                <h3><Link href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>{book.title}</Link></h3>
-                <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""}</p>
-                {savedById.has(book.id) ? <p>{savedById.get(book.id)?.status === "saved" ? "已入库" : "转存处理中"}</p> : null}
-                <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} />
+                <div className="candidate-title-row">
+                  <div>
+                    <h3><Link href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>{book.title}</Link></h3>
+                    <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""} · 书籍</p>
+                  </div>
+                  <div className="candidate-actions">
+                    <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} />
+                  </div>
+                </div>
+                <div className="candidate-meta">
+                  {savedById.has(book.id) ? <span className="hub-badge tone-green">{savedById.get(book.id)?.status === "saved" ? "已入库" : "转存处理中"}</span> : <span>电子书资源</span>}
+                </div>
               </div>
             </article>
           ))}

@@ -61,8 +61,18 @@ export interface ActivityCompletedItem {
   createdAt: string;
 }
 
+export interface ActivityBookItem {
+  runId: string;
+  title: string;
+  authors: string;
+  coverUrl: string | null;
+  status: "pending";
+  activity: string;
+}
+
 export interface ActivityView {
   active: ActivityActiveRun[];
+  books: ActivityBookItem[];
   /** Recently-finished runs (newest first). The CLIENT scopes 已完成 to this
    *  browser session by only showing the ones whose runId it observed active —
    *  robust to notification createdAt timing (which ≈ run-start, not finish). */
@@ -77,7 +87,7 @@ export interface ActivityView {
 export async function getActivityView(input: {
   repository: Pick<
     WorkflowRepository,
-    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates"
+    "listActiveWorkflowRuns" | "listNotifications" | "listTrackedSeasonStates" | "listBookEntries"
   >;
   /** Scope the queue/notifications to one account (§7). Omitted → default. */
   accountId?: string;
@@ -91,6 +101,16 @@ export async function getActivityView(input: {
   const activeRuns = (await input.repository.listActiveWorkflowRuns(scope)).filter((snapshot) =>
     isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
+  const books = (await input.repository.listBookEntries(scope ?? { accountId: "acct_default", connectedStorageId: null }))
+    .filter((entry) => entry.status === "pending")
+    .map((entry) => ({
+      runId: `book_${entry.book.id}`,
+      title: entry.book.title,
+      authors: entry.book.authors.join("、") || "作者未知",
+      coverUrl: entry.book.coverUrl,
+      status: "pending" as const,
+      activity: "正在等待网盘完成转存…",
+    }));
 
   // Poster backfill source: older notifications predate report.posterPath, so a
   // completed item can lack a poster. The title is still tracked → source the
@@ -169,7 +189,7 @@ export async function getActivityView(input: {
       };
     });
 
-  return { active, recentCompleted };
+  return { active, books, recentCompleted };
 }
 
 /** Why `POST /api/activity/retry` refused. Shared by the route and the activity
