@@ -16,7 +16,7 @@ function mapBook(row: DoubanBook): BookTitle | null {
     title,
     authors: stringValue(row.author_name).split(/[、,/]/).map((author) => author.trim()).filter(Boolean).slice(0, 5),
     year: /^\d{4}$/.test(stringValue(row.year)) ? Number(row.year) : null,
-    coverUrl: stringValue(row.pic) || null,
+    coverUrl: stringValue(row.pic) ? `/api/book-cover?url=${encodeURIComponent(stringValue(row.pic))}` : null,
     description: "",
     sourceUrl: stringValue(row.url) || `https://book.douban.com/subject/${id}/`,
   };

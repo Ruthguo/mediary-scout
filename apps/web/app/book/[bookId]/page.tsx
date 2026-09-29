@@ -37,7 +37,7 @@ async function BookContent({
   if (metadataQuery) {
     try {
       const latest = (await searchBooks(metadataQuery)).find((item) => item.id === bookId) ?? null;
-      if (latest) book = book ? { ...latest, ...book, description: book.description || latest.description, coverUrl: book.coverUrl || latest.coverUrl, sourceUrl: book.sourceUrl || latest.sourceUrl } : latest;
+      if (latest) book = book ? { ...latest, ...book, description: book.description || latest.description, coverUrl: latest.coverUrl || book.coverUrl, sourceUrl: book.sourceUrl || latest.sourceUrl } : latest;
     } catch { /* detail fallback below */ }
   }
   if (!book) {
