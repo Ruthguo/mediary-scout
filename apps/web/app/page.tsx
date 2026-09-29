@@ -208,7 +208,7 @@ async function BookSearchResults({ query, storageId }: { query: string; storageI
                     <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""} · 书籍</p>
                   </div>
                   <div className="candidate-actions">
-                    <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} />
+                    <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} initialStatus={savedById.get(book.id)?.status} />
                   </div>
                 </div>
                 <div className="candidate-meta">

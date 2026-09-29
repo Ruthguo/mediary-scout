@@ -57,7 +57,7 @@ async function BookContent({
             <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""}</p>
             {book.description ? <p className="book-description">{book.description}</p> : null}
             {saved ? <p className="panel-note">{saved.directoryPath} · {saved.fileCount} 个文件</p> : null}
-            <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} />
+            <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} initialStatus={saved?.status} />
             {book.sourceUrl ? <a className="panel-note" href={book.sourceUrl} target="_blank" rel="noopener noreferrer">查看书籍资料</a> : null}
           </div>
         </section>

@@ -609,6 +609,19 @@ p {
   max-width: 100%;
 }
 
+.book-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.book-actions .secondary-button {
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius-pill);
+}
+
 .book-transfer-action span {
   color: var(--text-muted);
   font-size: 12px;

@@ -201,6 +201,7 @@ export type WorkflowRunReservationResult =
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveBookEntry(entry: BookLibraryEntry): Promise<void>;
+  deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean>;
   getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null>;
   listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]>;
   saveWorkflowRunSnapshot(
@@ -414,6 +415,11 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
 
   async saveBookEntry(entry: BookLibraryEntry): Promise<void> {
     this.books.set(`${entry.accountId}\u0000${entry.connectedStorageId}\u0000${entry.book.id}`, cloneWorkflowValue(entry));
+  }
+
+  async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {
+    if (!scope.connectedStorageId) return false;
+    return this.books.delete(`${scope.accountId}\u0000${scope.connectedStorageId}\u0000${bookId}`);
   }
 
   async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {

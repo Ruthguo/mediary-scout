@@ -483,6 +483,16 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     );
   }
 
+  async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {
+    if (!scope.connectedStorageId) return false;
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "DELETE FROM book_entries WHERE account_id = $1 AND connected_storage_id = $2 AND book_id = $3",
+      [scope.accountId, scope.connectedStorageId, bookId],
+    );
+    return result.rowCount === 1;
+  }
+
   async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {
     if (!scope.connectedStorageId) return null;
     await this.ensureSchema();

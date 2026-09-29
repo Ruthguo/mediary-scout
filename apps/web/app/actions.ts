@@ -59,6 +59,19 @@ export async function requestBookAction(input: {
   }
 }
 
+export async function untrackBookAction(input: { bookId: string; storageId?: string | undefined }): Promise<{ status: "untracked" | "not_found"; message: string }> {
+  assertNotDemo();
+  const { requireAuthenticatedAccountId, getActiveWorkspaceScope, getWorkflowRepository } = await import("../lib/workflow-runtime");
+  await requireAuthenticatedAccountId();
+  const scope = await getActiveWorkspaceScope(input.storageId);
+  const removed = await getWorkflowRepository().deleteBookEntry(input.bookId, scope);
+  revalidatePath("/");
+  revalidatePath(`/book/${input.bookId}`);
+  return removed
+    ? { status: "untracked", message: "已取消追踪（网盘文件已保留）。" }
+    : { status: "not_found", message: "这本书未在当前网盘追踪。" };
+}
+
 /**
  * Acquire-time LLM pre-check (issue #52). Returns a not-started result carrying
  * the friendly "未配置 AI 模型" message when a live (vercel-ai) acquisition can't

@@ -1,26 +1,40 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { LoaderCircle, Plus } from "lucide-react";
+import { Check, LoaderCircle, Plus } from "lucide-react";
 import { requestBookAction } from "../app/actions";
+import { untrackBookAction } from "../app/actions";
+import { useRouter } from "../lib/use-router";
 
 export function BookTransferButton({
   query,
   bookId,
   storageId,
+  initialStatus,
 }: {
   query: string;
   bookId: string;
   storageId?: string | undefined;
+  initialStatus?: "pending" | "saved" | undefined;
 }) {
+  const router = useRouter();
   const [pending, startTransition] = useTransition();
-  const [result, setResult] = useState<{ status: string; message: string } | null>(null);
+  const [result, setResult] = useState<{ status: string; message: string } | null>(
+    initialStatus === "saved"
+      ? { status: "saved", message: "这本书已入库。" }
+      : initialStatus === "pending"
+        ? { status: "pending", message: "转存处理中。" }
+        : null,
+  );
+  if (result?.status === "saved") {
+    return <div className="request-track book-actions"><span className="hub-badge tone-green"><Check size={12} aria-hidden />已获取</span><button className="secondary-button" type="button" onClick={() => startTransition(async () => { await untrackBookAction({ bookId, storageId }); router.refresh(); })}>取消追踪</button></div>;
+  }
   return (
-    <div className="book-transfer-action">
+    <div className="request-track book-actions">
       <button
         className="primary-button"
         type="button"
-        disabled={pending || result?.status === "saved" || result?.status === "pending"}
+        disabled={pending || result?.status === "pending"}
         onClick={() => startTransition(async () => {
           try {
             setResult(await requestBookAction({ query, bookId, storageId }));

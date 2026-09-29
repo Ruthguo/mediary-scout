@@ -339,6 +339,14 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     ).run(entry.accountId, entry.connectedStorageId, entry.book.id, entry.updatedAt, JSON.stringify(entry));
   }
 
+  async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {
+    if (!scope.connectedStorageId) return false;
+    const result = this.db.prepare(
+      "DELETE FROM book_entries WHERE account_id = ? AND connected_storage_id = ? AND book_id = ?",
+    ).run(scope.accountId, scope.connectedStorageId, bookId);
+    return result.changes === 1;
+  }
+
   async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {
     if (!scope.connectedStorageId) return null;
     const row = this.db.prepare(
