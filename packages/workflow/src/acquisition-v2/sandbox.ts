@@ -863,10 +863,10 @@ export class TaskSandbox {
     this.rawSnapshot = snapshot;
   }
 
-  /** Read-only tool: view the pre-warmed raw snapshot as a structured document.
-   *  Free, repeatable, does NOT consume search budget. Returns id + title for each
-   *  candidate (truncated at 120 if excessive). */
-  viewResourceSnapshot(): { document: string; candidateCount: number } {
+  /** Read-only, paged view of the pre-warmed raw snapshot. Put titles containing
+   *  the bare search term first: PanSou can return hundreds of unrelated results
+   *  before the exact title, and the model otherwise never sees those links. */
+  viewResourceSnapshot(options: { offset?: number } = {}): { document: string; candidateCount: number } {
     if (!this.rawSnapshot) {
       return {
         document: "No raw snapshot available. Call primeRawSnapshot first.",
@@ -876,17 +876,24 @@ export class TaskSandbox {
 
     const candidates = this.rawSnapshot.candidates;
     const total = candidates.length;
-    const truncated = candidates.slice(0, 120);
-    const remaining = total - truncated.length;
+    const searchTerm = this.rawSnapshot.keyword.normalize("NFKC").toLocaleLowerCase().trim();
+    const matches = searchTerm
+      ? candidates.filter((candidate) => candidate.title.normalize("NFKC").toLocaleLowerCase().includes(searchTerm))
+      : [];
+    const matchedIds = new Set(matches.map((candidate) => candidate.id));
+    const ranked = [...matches, ...candidates.filter((candidate) => !matchedIds.has(candidate.id))];
+    const offset = options.offset ?? 0;
+    const page = ranked.slice(offset, offset + 120);
+    const remaining = Math.max(0, total - offset - page.length);
 
-    let document = `📋 Raw snapshot (${total} candidates):\n\n`;
+    let document = `📋 Raw snapshot (${total} candidates; ${matches.length} title matches; showing ${offset + 1}-${offset + page.length}):\n\n`;
 
-    for (const candidate of truncated) {
+    for (const candidate of page) {
       document += `[${candidate.id}] ${candidate.title}\n`;
     }
 
     if (remaining > 0) {
-      document += `\n... 还有 ${remaining} 条。如需更多,可用 searchResources 搜繁体/英文关键词。\n`;
+      document += `\n... 还有 ${remaining} 条。调用 viewResourceSnapshot({offset:${offset + page.length}}) 查看下一页，不耗搜索预算。\n`;
     }
 
     return { document, candidateCount: total };

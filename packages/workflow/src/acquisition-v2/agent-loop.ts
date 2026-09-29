@@ -113,9 +113,9 @@ export function buildSandboxToolSet(
     },
     viewResourceSnapshot: {
       description:
-        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you; this returns all those candidates (id + title). Use this FIRST to see what's available. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient.",
-      inputSchema: z.object({}),
-      execute: () => Promise.resolve(sandbox.viewResourceSnapshot()),
+        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you. Returns 120 candidates per page (id + title), with title matches first; pass the displayed next offset to see more. Use this FIRST. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient.",
+      inputSchema: z.object({ offset: z.number().int().nonnegative().optional() }),
+      execute: (args: { offset?: number }) => Promise.resolve(sandbox.viewResourceSnapshot(args)),
     },
     searchResources: {
       description:

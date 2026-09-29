@@ -160,7 +160,7 @@ function rawSnapshotPointer(options: TaskAgentPromptOptions): string {
   if (options.prefetchedCandidateCount === undefined || options.prefetchedCandidateCount === 0) {
     return "";
   }
-  return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() to view this live document — it's free, read-only, and contains all the raw candidates (id + title). Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
+  return `\n📋 RAW SNAPSHOT (活期文档): The system has already pre-searched the raw keyword (bare title) for you and found ${options.prefetchedCandidateCount} candidates. Your FIRST step: call viewResourceSnapshot() — it's free, read-only, and shows title matches first, then the other candidates in pages of 120 (id + title). Follow the displayed offset to read more pages if needed. Do NOT use searchResources to re-search the raw keyword; searchResources is ONLY for 繁体/英文/原名 upgrades when the raw snapshot is insufficient.\n`;
 }
 
 /** The subtitle twin of rawSnapshotPointer — rendered only when the subtitle flow
