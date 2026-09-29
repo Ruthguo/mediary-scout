@@ -2603,20 +2603,22 @@ export async function transferBookResource(input: {
     return { status: "failed", message: attempt.providerMessage || "网盘转存失败。" };
   }
   const files = await executor.listTree({ directoryId: targetDir });
+  const ebookFiles = files.filter((file) => /\.(epub|azw3?|mobi|txt|pdf|cbz|cbr)$/i.test(file.name));
+  const archiveOnly = files.length > 0 && ebookFiles.length === 0 && files.every((file) => /\.(zip|7z|rar|tar|gz)$/i.test(file.name));
   await repository.saveBookEntry({
     book: input.book,
     accountId,
     connectedStorageId: choice.id,
-    status: files.length > 0 ? "saved" : "pending",
+    status: files.length > 0 && !archiveOnly ? "saved" : "pending",
     directoryId: targetDir,
     directoryPath: `Books/${folderName}`,
     fileCount: files.length,
     updatedAt: new Date().toISOString(),
   });
-  if (files.length > 0) {
+  if (files.length > 0 && !archiveOnly) {
     return { status: "saved", message: `已转存到 Books/${folderName}（${files.length} 个文件）。` };
   }
-  return { status: "pending", message: `网盘已接收转存请求，请稍后查看 Books/${folderName}。` };
+  return { status: "pending", message: archiveOnly ? `已转存压缩包到 Books/${folderName}，尚未确认内部电子书文件。` : `网盘已接收转存请求，请稍后查看 Books/${folderName}。` };
 }
 
 /** Book decisions use the account's configured acquisition model. The model sees
