@@ -42,6 +42,19 @@ export function isBookResourceTitle(candidateTitle: string, bookTitle: string): 
   return true;
 }
 
+/** PanSou is ordered for broad media search, so a book's exact title can be
+ * buried behind unrelated titles that merely contain one character. Rank the
+ * candidates before the caller's safety limit is applied. */
+export function bookResourceRank(candidateTitle: string, bookTitle: string): number {
+  const title = normalizeTitleForContainment(candidateTitle);
+  const name = normalizeTitleForContainment(bookTitle);
+  let score = title === name ? 1000 : title.includes(name) ? 300 : 0;
+  if (/小说文学|电子书|ebook|全格式|文字版|精校|kindle/i.test(candidateTitle)) score += 180;
+  if (/\b(epub|azw3?|mobi|txt|pdf)\b|\.(epub|azw3?|mobi|txt|pdf)(?:$|[\s._-])/i.test(candidateTitle)) score += 120;
+  if (/短剧|电视剧|电影|动漫|有声|听书|朗读|音频|音乐|游戏|课程/i.test(candidateTitle)) score -= 800;
+  return score;
+}
+
 export async function searchBookLinks(query: string): Promise<BookSearchResult> {
   const keyword = query.trim().slice(0, 120);
   if (!keyword) return { links: [], status: "healthy" };
@@ -59,6 +72,7 @@ export async function searchBookLinks(query: string): Promise<BookSearchResult> 
         .filter((candidate) => isBookResourceTitle(candidate.title, keyword))
         .map(bookLink)
         .filter((link): link is BookLink => link !== null)
+        .sort((a, b) => bookResourceRank(b.title, keyword) - bookResourceRank(a.title, keyword))
         .slice(0, 80),
       status: snapshot.sourceHealth?.status ?? "healthy",
     };
