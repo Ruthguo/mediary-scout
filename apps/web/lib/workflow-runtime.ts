@@ -125,6 +125,18 @@ let fakeStorageExecutor: StorageExecutor | null = null;
 // accounts with different LLM configs each keep their own built model — a single
 // slot would thrash between accounts in multi-user mode.
 const agentModelCache = new Map<string, ReturnType<typeof createAgentModelFromEnv>>();
+const pendingBookActivities = new Map<string, { runId: string; title: string; authors: string; coverUrl: string | null; accountId: string; storageId: string; activity: string }>();
+export function listPendingBookActivities(accountId: string, storageId: string | null) {
+  return [...pendingBookActivities.values()]
+    .filter((item) => item.accountId === accountId && item.storageId === (storageId ?? ""))
+    .map(({ accountId: _accountId, storageId: _storageId, ...item }) => ({ ...item, status: "pending" as const }));
+}
+export function startBookActivity(input: { book: BookTitle; accountId: string; storageId: string }) {
+  const runId = `book_${crypto.randomUUID()}`;
+  pendingBookActivities.set(runId, { runId, title: input.book.title, authors: input.book.authors.join("、") || "作者未知", coverUrl: input.book.coverUrl, accountId: input.accountId, storageId: input.storageId, activity: "正在筛选电子书资源…" });
+  return runId;
+}
+export function finishBookActivity(runId: string) { pendingBookActivities.delete(runId); }
 
 /** The Postgres connection string for durable dev/prod state. SQLite has been
  *  retired — dev runs on OrbStack Postgres. */

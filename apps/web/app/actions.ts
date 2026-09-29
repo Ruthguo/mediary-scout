@@ -13,7 +13,7 @@ export async function requestBookAction(input: {
   storageId?: string | undefined;
 }): Promise<{ status: "saved" | "pending" | "unsupported" | "failed" | "no_coverage"; message: string }> {
   assertNotDemo();
-  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope, selectBookResource, transferBookResource } = await import("../lib/workflow-runtime");
+  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope, selectBookResource, transferBookResource, startBookActivity, finishBookActivity } = await import("../lib/workflow-runtime");
   await requireAuthenticatedAccountId();
   const query = input.query.trim();
   if (!query || query.length > 120) {
@@ -43,6 +43,7 @@ export async function requestBookAction(input: {
   const allowed = new Set(allowedResourceTypesForKinds(getStorageBrand(drive.provider).resourceProviderKinds));
   const candidates = result.links.filter((link) => link.type !== "magnet" && allowed.has(link.type)).slice(0, 40);
   if (candidates.length === 0) return { status: "no_coverage", message: "暂未找到这本书的资源。" };
+  const activityId = startBookActivity({ book, accountId: scope.accountId, storageId: scope.connectedStorageId ?? "" });
   try {
     const selected = await selectBookResource({ book, candidates });
     if (selected === null) return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
@@ -53,6 +54,8 @@ export async function requestBookAction(input: {
     return saved;
   } catch (error) {
     return { status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" };
+  } finally {
+    finishBookActivity(activityId);
   }
 }
 
