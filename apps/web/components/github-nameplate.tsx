@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { SupportAuthorLink } from "./support-author-link";
 
 /** Small open-source nameplate at the bottom of every app page's main column
  *  (search / library, show detail, activity, notifications, settings) — a quiet
@@ -34,7 +33,6 @@ export function GitHubNameplate() {
           Mediary Scout · 开源自部署 · <span className="github-nameplate-cta">GitHub →</span>
         </span>
       </Link>
-      <SupportAuthorLink />
     </footer>
   );
 }
