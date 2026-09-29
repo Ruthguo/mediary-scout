@@ -3,6 +3,44 @@
 import { revalidatePath } from "next/cache";
 import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "../lib/workflow-runtime";
 import { assertNotDemo } from "../lib/demo-mode";
+import { searchBookLinks } from "../lib/book-search";
+import { getBookMetadata } from "../lib/book-metadata";
+
+export async function transferBookAction(input: {
+  query: string;
+  url: string;
+  bookId: string;
+  storageId?: string | undefined;
+}): Promise<{ status: "saved" | "pending" | "unsupported" | "failed"; message: string }> {
+  assertNotDemo();
+  const { requireAuthenticatedAccountId, transferBookResource } = await import("../lib/workflow-runtime");
+  await requireAuthenticatedAccountId();
+  const query = input.query.trim();
+  if (!query || query.length > 120 || input.url.length > 2048) {
+    return { status: "unsupported", message: "搜索内容无效，请重新搜索。" };
+  }
+  // Re-fetch on the server so a caller cannot submit an arbitrary URL to a
+  // privileged drive executor. The selected URL must be in this account's
+  // current PanSou result set.
+  const result = await searchBookLinks(query);
+  const link = result.links.find((entry) => entry.url === input.url);
+  if (!link) return { status: "unsupported", message: "资源已失效，请重新搜索。" };
+  let book;
+  try {
+    book = await getBookMetadata(input.bookId);
+  } catch {
+    return { status: "failed", message: "书籍资料暂时不可用，请稍后重试。" };
+  }
+  if (!book) return { status: "unsupported", message: "书籍条目已更新，请重新搜索。" };
+  try {
+    const saved = await transferBookResource({ ...link, book, query, storageId: input.storageId });
+    revalidatePath("/");
+    revalidatePath(`/book/${book.id}`);
+    return saved;
+  } catch (error) {
+    return { status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" };
+  }
+}
 
 /**
  * Acquire-time LLM pre-check (issue #52). Returns a not-started result carrying

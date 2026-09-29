@@ -10,6 +10,7 @@ import {
 } from "./domain.js";
 import type {
   AgentDecision,
+  BookLibraryEntry,
   AgentStep,
   EpisodeState,
   MediaTitle,
@@ -105,6 +106,16 @@ import type {
  * matches Postgres so later tasks behave identically.
  */
 export const SQLITE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS book_entries (
+    account_id text NOT NULL,
+    connected_storage_id text NOT NULL,
+    book_id text NOT NULL,
+    updated_at text NOT NULL,
+    payload text NOT NULL,
+    PRIMARY KEY (account_id, connected_storage_id, book_id)
+  );
+  CREATE INDEX IF NOT EXISTS book_entries_scope_updated_idx
+    ON book_entries (account_id, connected_storage_id, updated_at DESC);
   CREATE TABLE IF NOT EXISTS media_titles (
     id text PRIMARY KEY,
     payload text NOT NULL
@@ -317,6 +328,31 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
 
   close(): void {
     this.db.close();
+  }
+
+  async saveBookEntry(entry: BookLibraryEntry): Promise<void> {
+    this.db.prepare(
+      `INSERT INTO book_entries (account_id, connected_storage_id, book_id, updated_at, payload)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (account_id, connected_storage_id, book_id)
+       DO UPDATE SET updated_at = excluded.updated_at, payload = excluded.payload`,
+    ).run(entry.accountId, entry.connectedStorageId, entry.book.id, entry.updatedAt, JSON.stringify(entry));
+  }
+
+  async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {
+    if (!scope.connectedStorageId) return null;
+    const row = this.db.prepare(
+      "SELECT payload FROM book_entries WHERE account_id = ? AND connected_storage_id = ? AND book_id = ?",
+    ).get(scope.accountId, scope.connectedStorageId, bookId) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as BookLibraryEntry : null;
+  }
+
+  async listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]> {
+    if (!scope.connectedStorageId) return [];
+    const rows = this.db.prepare(
+      "SELECT payload FROM book_entries WHERE account_id = ? AND connected_storage_id = ? ORDER BY updated_at DESC",
+    ).all(scope.accountId, scope.connectedStorageId) as Array<{ payload: string }>;
+    return rows.map((row) => JSON.parse(row.payload) as BookLibraryEntry);
   }
 
   async saveWorkflowRunSnapshot(

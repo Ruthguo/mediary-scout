@@ -47,6 +47,7 @@ const PROBE_TIMEOUT_MS = (() => {
 
 // Every table the workflow schema owns — TRUNCATE between make()s for a fresh repo.
 const TABLES = [
+  "book_entries",
   "media_titles",
   "tracked_seasons",
   "workflow_runs",

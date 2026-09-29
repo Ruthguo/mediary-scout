@@ -14,6 +14,29 @@ export function isStagingJanitorId(id: string): boolean {
 }
 
 export type MediaType = "movie" | "tv" | "anime";
+
+/** Books have their own catalog identity and file-based completion state. A
+ *  season/episode MediaTitle cannot represent one without inventing episodes. */
+export interface BookTitle {
+  id: string;
+  title: string;
+  authors: string[];
+  year: number | null;
+  coverUrl: string | null;
+  description: string;
+  sourceUrl: string;
+}
+
+export interface BookLibraryEntry {
+  book: BookTitle;
+  accountId: string;
+  connectedStorageId: string;
+  status: "pending" | "saved";
+  directoryId: string;
+  directoryPath: string;
+  fileCount: number;
+  updatedAt: string;
+}
 export type SeasonStatus = "active" | "completed";
 export type LatestAiredSource = "metadata" | "manual" | "unknown";
 export type AirStatus = "aired" | "unaired" | "unknown";

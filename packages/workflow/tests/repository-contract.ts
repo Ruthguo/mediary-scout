@@ -63,6 +63,27 @@ export function runRepositoryContract(name: string, harness: RepoHarness): void 
       });
     });
 
+    it("keeps book entries scoped to the owning account and drive", async () => {
+      const repo = await fresh();
+      const book = {
+        id: "OL17267881W", title: "三体", authors: ["刘慈欣"], year: 2008,
+        coverUrl: null, description: "", sourceUrl: "https://openlibrary.org/works/OL17267881W",
+      };
+      const entry = {
+        book, accountId: "acct_a", connectedStorageId: "drive_a", status: "pending" as const,
+        directoryId: "dir_a", directoryPath: "Books/三体", fileCount: 0,
+        updatedAt: "2026-09-29T00:00:00.000Z",
+      };
+      await repo.saveBookEntry(entry);
+      expect(await repo.getBookEntry(book.id, { accountId: "acct_a", connectedStorageId: "drive_a" })).toEqual(entry);
+      expect(await repo.listBookEntries({ accountId: "acct_a", connectedStorageId: "drive_b" })).toEqual([]);
+      expect(await repo.getBookEntry(book.id, { accountId: "acct_b", connectedStorageId: "drive_a" })).toBeNull();
+      await repo.saveBookEntry({ ...entry, status: "saved", fileCount: 1 });
+      expect(await repo.listBookEntries({ accountId: "acct_a", connectedStorageId: "drive_a" })).toEqual([
+        { ...entry, status: "saved", fileCount: 1 },
+      ]);
+    });
+
     describe("user requests", () => {
       const scope = { accountId: "acct_a", drive: "cs_1", titleKey: "tmdb_tv_1" };
       const t0 = "2026-09-26T00:00:00.000Z";

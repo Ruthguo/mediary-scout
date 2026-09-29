@@ -7,6 +7,7 @@ import {
   isStagingJanitorId,
   isUserVisibleWorkflowKind,
   type AgentDecision,
+  type BookLibraryEntry,
   type AgentStep,
   type EpisodeState,
   type MediaTitle,
@@ -92,6 +93,16 @@ type Queryable = Pool | PoolClient;
 // jsonb `payload` holding the domain object. node-postgres returns jsonb columns
 // already parsed, and `$n::jsonb` casts a JSON.stringify'd text param on insert.
 const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS book_entries (
+    account_id text NOT NULL,
+    connected_storage_id text NOT NULL,
+    book_id text NOT NULL,
+    updated_at text NOT NULL,
+    payload jsonb NOT NULL,
+    PRIMARY KEY (account_id, connected_storage_id, book_id)
+  );
+  CREATE INDEX IF NOT EXISTS book_entries_scope_updated_idx
+    ON book_entries (account_id, connected_storage_id, updated_at DESC);
   CREATE TABLE IF NOT EXISTS media_titles (
     id text PRIMARY KEY,
     payload jsonb NOT NULL
@@ -459,6 +470,37 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       });
     }
     return this.schemaReady;
+  }
+
+  async saveBookEntry(entry: BookLibraryEntry): Promise<void> {
+    await this.ensureSchema();
+    await this.pool.query(
+      `INSERT INTO book_entries (account_id, connected_storage_id, book_id, updated_at, payload)
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT (account_id, connected_storage_id, book_id)
+       DO UPDATE SET updated_at = EXCLUDED.updated_at, payload = EXCLUDED.payload`,
+      [entry.accountId, entry.connectedStorageId, entry.book.id, entry.updatedAt, JSON.stringify(entry)],
+    );
+  }
+
+  async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {
+    if (!scope.connectedStorageId) return null;
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "SELECT payload FROM book_entries WHERE account_id = $1 AND connected_storage_id = $2 AND book_id = $3",
+      [scope.accountId, scope.connectedStorageId, bookId],
+    );
+    return (result.rows[0]?.payload as BookLibraryEntry | undefined) ?? null;
+  }
+
+  async listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]> {
+    if (!scope.connectedStorageId) return [];
+    await this.ensureSchema();
+    const result = await this.pool.query(
+      "SELECT payload FROM book_entries WHERE account_id = $1 AND connected_storage_id = $2 ORDER BY updated_at DESC",
+      [scope.accountId, scope.connectedStorageId],
+    );
+    return result.rows.map((row) => row.payload as BookLibraryEntry);
   }
 
   async saveWorkflowRunSnapshot(

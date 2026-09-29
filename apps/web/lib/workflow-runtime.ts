@@ -83,6 +83,8 @@ import {
   type NotificationEvent,
   type ResourceProvider,
   type ResourceType,
+  type ResourceCandidate,
+  type BookTitle,
   type SeasonMetadataSync,
   type StagingJanitorDrive,
   type StorageExecutor,
@@ -2520,6 +2522,91 @@ async function getWorkerStorageExecutor(
     transferOutcomes: fakeTransferOutcomes(),
   });
   return fakeStorageExecutor;
+}
+
+/** Save a user-selected book share into this account's selected drive. Books use
+ * their own folder: the video acquisition workflow's completion checks cannot
+ * recognise ebooks, but the executor's share ingest and full-tree read can. */
+export async function transferBookResource(input: {
+  storageId?: string | undefined;
+  query: string;
+  url: string;
+  type: ResourceType;
+  password: string;
+  title: string;
+  book: BookTitle;
+}): Promise<{ status: "saved" | "pending" | "unsupported" | "failed"; message: string }> {
+  const accountId = await requireAuthenticatedAccountId();
+  const choice = await resolveQueueStorage(accountId, input.storageId);
+  if (choice.unknown || !choice.id) return { status: "unsupported", message: "请先连接网盘。" };
+  if (choice.frozen) return { status: "unsupported", message: "该网盘已掉线，请先重新连接。" };
+  const creds = await getAccountStorageCredentials(accountId, choice.id);
+  if (!creds || !creds.rootCid || creds.status !== "active") {
+    return { status: "unsupported", message: "当前网盘的凭据或目录不可用。" };
+  }
+  const kinds = getStorageBrand(creds.provider).resourceProviderKinds;
+  if (input.type === "magnet" || !allowedResourceTypesForKinds(kinds).includes(input.type)) {
+    return { status: "unsupported", message: "这条链接无法转存到当前网盘。" };
+  }
+  const repository = getWorkflowRepository();
+  const existing = await repository.getBookEntry(input.book.id, { accountId, connectedStorageId: choice.id });
+  if (existing?.status === "saved") {
+    return { status: "saved", message: `这本书已在 ${existing.directoryPath}。` };
+  }
+  const executor = await getWorkerStorageExecutor(accountId, choice.id);
+  const booksDir = (await executor.listChildDirectories(creds.rootCid)).find((dir) => dir.name === "Books")?.id
+    ?? await executor.createDirectory({ name: "Books", parentId: creds.rootCid });
+  const folderName = input.book.title.trim().replace(/[\\/:*?"<>|\r\n]/g, " ").slice(0, 80) || "书籍";
+  const targetDir = existing?.directoryId
+    ?? (await executor.listChildDirectories(booksDir)).find((dir) => dir.name === folderName)?.id
+    ?? await executor.createDirectory({ name: folderName, parentId: booksDir });
+  const runId = `book_${crypto.randomUUID()}`;
+  const candidate: ResourceCandidate = {
+    id: `${runId}_candidate`,
+    snapshotId: `${runId}_snapshot`,
+    index: 0,
+    title: input.title,
+    type: input.type,
+    source: "pansou",
+    providerPayload: { url: input.url, password: input.password },
+  };
+  const attempt = await executor.transfer({ workflowRunId: runId, directoryId: targetDir, candidate });
+  if (attempt.status === "failed") {
+    return { status: "failed", message: attempt.providerMessage || "网盘转存失败。" };
+  }
+  const files = await executor.listTree({ directoryId: targetDir });
+  await repository.saveBookEntry({
+    book: input.book,
+    accountId,
+    connectedStorageId: choice.id,
+    status: files.length > 0 ? "saved" : "pending",
+    directoryId: targetDir,
+    directoryPath: `Books/${folderName}`,
+    fileCount: files.length,
+    updatedAt: new Date().toISOString(),
+  });
+  if (files.length > 0) {
+    return { status: "saved", message: `已转存到 Books/${folderName}（${files.length} 个文件）。` };
+  }
+  return { status: "pending", message: `网盘已接收转存请求，请稍后查看 Books/${folderName}。` };
+}
+
+/** Reconcile an asynchronous share save when its detail page is opened later. */
+export async function refreshPendingBookEntry(bookId: string, storageId?: string) {
+  const scope = await getActiveWorkspaceScope(storageId);
+  const repository = getWorkflowRepository();
+  const entry = await repository.getBookEntry(bookId, scope);
+  if (!entry || entry.status !== "pending") return entry;
+  try {
+    const executor = await getWorkerStorageExecutor(scope.accountId, entry.connectedStorageId);
+    const files = await executor.listTree({ directoryId: entry.directoryId });
+    if (files.length === 0) return entry;
+    const updated = { ...entry, status: "saved" as const, fileCount: files.length, updatedAt: new Date().toISOString() };
+    await repository.saveBookEntry(updated);
+    return updated;
+  } catch {
+    return entry;
+  }
 }
 
 /**

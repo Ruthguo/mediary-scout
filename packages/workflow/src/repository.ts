@@ -4,6 +4,7 @@ import {
   isUserVisibleNotificationKind,
   isUserVisibleWorkflowKind,
   type AgentDecision,
+  type BookLibraryEntry,
   type AgentStep,
   type EpisodeState,
   type MediaTitle,
@@ -199,6 +200,9 @@ export type WorkflowRunReservationResult =
     };
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
+  saveBookEntry(entry: BookLibraryEntry): Promise<void>;
+  getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null>;
+  listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]>;
   saveWorkflowRunSnapshot(
     input: PersistWorkflowRunSnapshotInput & {
       /** Write the run only. The season's episode bucket stays as stored.
@@ -406,6 +410,25 @@ export class DuplicateUsernameError extends Error {
 }
 
 export class InMemoryWorkflowRepository implements WorkflowRepository {
+  private readonly books = new Map<string, BookLibraryEntry>();
+
+  async saveBookEntry(entry: BookLibraryEntry): Promise<void> {
+    this.books.set(`${entry.accountId}\u0000${entry.connectedStorageId}\u0000${entry.book.id}`, cloneWorkflowValue(entry));
+  }
+
+  async getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null> {
+    if (!scope.connectedStorageId) return null;
+    const entry = this.books.get(`${scope.accountId}\u0000${scope.connectedStorageId}\u0000${bookId}`);
+    return entry ? cloneWorkflowValue(entry) : null;
+  }
+
+  async listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]> {
+    if (!scope.connectedStorageId) return [];
+    return Array.from(this.books.values())
+      .filter((entry) => entry.accountId === scope.accountId && entry.connectedStorageId === scope.connectedStorageId)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .map(cloneWorkflowValue);
+  }
   private readonly workflowRuns = new Map<string, PersistWorkflowRunSnapshotInput>();
   private readonly episodesBySeason = new Map<string, EpisodeState[]>();
   private readonly settings = new Map<string, string>();

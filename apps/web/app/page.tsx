@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { Suspense } from "react";
-import { CalendarClock, CheckCircle2, Clock3, Library, LoaderCircle, TriangleAlert } from "lucide-react";
+import { BookOpen, CalendarClock, CheckCircle2, Clock3, Library, LoaderCircle, TriangleAlert } from "lucide-react";
 import { AcquiringPoller } from "../components/acquiring-poller";
 import { AppSidebar } from "../components/app-sidebar";
 import { RequestTrackButton } from "../components/request-track-button";
@@ -14,6 +14,7 @@ import { ConnectNoticeBanner } from "../components/connect-notice-banner";
 import { GitHubNameplate } from "../components/github-nameplate";
 import type { TrendingKind } from "../lib/trending";
 import { getSearchView } from "../lib/search-page";
+import { searchBooks } from "../lib/book-metadata";
 import {
   getInProgressTitles,
   getLibraryWall,
@@ -29,7 +30,7 @@ import {
 import { resolveConnectNoticeConditions } from "../lib/connect-notice-server";
 import { shouldShowConnectNotice } from "../lib/connect-notice";
 import { showHref } from "@media-track/workflow";
-import type { SearchCandidateCard, TrackedSeasonState } from "@media-track/workflow";
+import type { BookLibraryEntry, SearchCandidateCard, TrackedSeasonState } from "@media-track/workflow";
 
 export default function Page({
   searchParams,
@@ -80,6 +81,7 @@ async function HomeSurface({
 }) {
   const params = (await searchParams) ?? {};
   const query = stringParam(params.q);
+  const searchKind = stringParam(params.kind) === "book" ? "book" : "media";
   const activeTab = stringParam(params.tab) === "library" ? "library" : "search";
   const mediaType = stringParam(params.type) || "all";
   const filter = stringParam(params.filter) || "all";
@@ -99,7 +101,7 @@ async function HomeSurface({
 
   return (
     <div className="app-shell">
-      <AppSidebar active={activeTab} searchQuery={query} basePath={basePath} activeStorageId={storageId} />
+      <AppSidebar active={activeTab} searchQuery={searchKind === "media" ? query : ""} basePath={basePath} activeStorageId={storageId} />
 
       <main className="main product-main">
         {showConnectNotice ? (
@@ -107,26 +109,34 @@ async function HomeSurface({
         ) : null}
         {activeTab === "search" ? (
           <section className="search-surface">
-            <RememberQuery query={query} basePath={basePath} />
+            {searchKind === "media" ? <RememberQuery query={query} basePath={basePath} /> : null}
             <div className="search-hero">
               <div>
-                <h1>搜索</h1>
-                <p>找到目标后发起获取，后台会处理资源判断、转存和验证。</p>
+                <h1>{searchKind === "book" ? "搜书" : "搜索"}</h1>
+                <p>{searchKind === "book" ? "搜索书名或作者，进入书籍条目查看资源并转存到当前网盘。" : "找到目标后发起获取，后台会处理资源判断、转存和验证。"}</p>
               </div>
-              <SearchForm basePath={basePath} defaultQuery={query} />
+              <SearchForm basePath={basePath} defaultQuery={query} kind={searchKind} />
             </div>
-            {driveCount >= 2 ? (
+            <nav className="search-kind-tabs" aria-label="搜索类型">
+              <Link className={searchKind === "media" ? "is-active" : ""} href={`${basePath}?tab=search&kind=media&q=${encodeURIComponent(query)}`}>影视</Link>
+              <Link className={searchKind === "book" ? "is-active" : ""} href={`${basePath}?tab=search&kind=book&q=${encodeURIComponent(query)}`}>书籍资源</Link>
+            </nav>
+            {searchKind === "media" && driveCount >= 2 ? (
               <p className="panel-note" style={{ marginTop: -4, marginBottom: 4 }}>
                 搜索与获取按网盘隔离 —— 想为某块盘获取资源，请切到该盘后在它的搜索页操作。
               </p>
             ) : null}
-            <Suspense key={`search-${query}`} fallback={<SearchResultsSkeleton />}>
-              <SearchResults
-                query={query}
-                storageId={storageId}
-                activeTrending={activeTrending}
-                basePath={basePath}
-              />
+            <Suspense key={`search-${searchKind}-${query}`} fallback={<SearchResultsSkeleton />}>
+              {searchKind === "book" ? (
+                <BookSearchResults query={query} storageId={storageId} />
+              ) : (
+                <SearchResults
+                  query={query}
+                  storageId={storageId}
+                  activeTrending={activeTrending}
+                  basePath={basePath}
+                />
+              )}
             </Suspense>
           </section>
         ) : (
@@ -140,6 +150,67 @@ async function HomeSurface({
         <GitHubNameplate />
       </main>
     </div>
+  );
+}
+
+async function BookSearchResults({ query, storageId }: { query: string; storageId?: string | undefined }) {
+  if (!query.trim()) {
+    return (
+      <div className="quiet-state compact">
+        <BookOpen size={24} aria-hidden />
+        <strong>输入书名或作者开始搜索</strong>
+      </div>
+    );
+  }
+  let books;
+  try {
+    books = await searchBooks(query);
+  } catch {
+    return (
+      <div className="quiet-state compact" role="alert">
+        <TriangleAlert size={22} aria-hidden />
+        <strong>书籍资料暂时不可用</strong>
+        <span>请稍后重试。</span>
+      </div>
+    );
+  }
+  const bookScope = await getActiveWorkspaceScope(storageId);
+  const savedById = new Map((await getWorkflowRepository().listBookEntries(bookScope)).map((entry) => [entry.book.id, entry]));
+  return (
+    <section className="search-results" aria-label="书籍资源结果">
+      <div className="section-heading">
+        <div>
+          <h2>书籍</h2>
+          <p>{books.length} 个条目</p>
+        </div>
+      </div>
+      {books.length === 0 ? (
+        <div className="quiet-state compact">
+          <BookOpen size={22} aria-hidden />
+          <strong>没有找到书籍</strong>
+          <span>试试书名、作者或不同的关键词。</span>
+        </div>
+      ) : (
+        <div className="candidate-grid">
+          {books.map((book) => (
+            <article className="candidate-card" key={book.id}>
+              <Link className="candidate-poster" href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>
+                {book.coverUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={book.coverUrl} alt="" loading="lazy" />
+                ) : <BookOpen size={28} aria-hidden />}
+              </Link>
+              <div className="candidate-body">
+                <h3><Link href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>{book.title}</Link></h3>
+                <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""}</p>
+                {savedById.has(book.id) ? <p>{savedById.get(book.id)?.status === "saved" ? "已入库" : "转存处理中"}</p> : null}
+                <Link className="primary-button" href={`/book/${book.id}?q=${encodeURIComponent(book.title)}${storageId ? `&w=${encodeURIComponent(storageId)}` : ""}`}>查看书籍</Link>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -418,12 +489,13 @@ function CandidateCard({
 }
 
 async function LibrarySurface({ mediaType, filter, storageId }: { mediaType: string; filter: string; storageId?: string | undefined }) {
-  const [rawWall, inProgress] = await Promise.all([getLibraryWall(storageId), getInProgressTitles(storageId)]);
+  const [rawWall, inProgress, bookScope] = await Promise.all([getLibraryWall(storageId), getInProgressTitles(storageId), getActiveWorkspaceScope(storageId)]);
+  const books = await getWorkflowRepository().listBookEntries(bookScope);
   const inProgressIds = new Set(inProgress.map((title) => title.tmdbId));
   // A title still being fetched shows as a 获取中 placeholder, not (yet) a card.
   const wall = rawWall.filter((entry) => !inProgressIds.has(entry.tmdbId));
 
-  if (wall.length === 0 && inProgress.length === 0) {
+  if (wall.length === 0 && inProgress.length === 0 && books.length === 0) {
     return (
       <section className="library-surface">
         <div className="quiet-state">
@@ -457,6 +529,16 @@ async function LibrarySurface({ mediaType, filter, storageId }: { mediaType: str
         <CategoryRow label="电影" type="movie" {...byType("movie")} storageId={storageId} />
         <CategoryRow label="电视剧" type="tv" {...byType("tv")} storageId={storageId} />
         <CategoryRow label="动漫" type="anime" {...byType("anime")} storageId={storageId} />
+        <BookCategoryRow books={books} storageId={storageId} />
+      </section>
+    );
+  }
+
+  if (mediaType === "book") {
+    return (
+      <section className="library-surface">
+        <div className="section-heading library-heading"><div><h1><Link href={`${storageId ? `/w/${storageId}` : "/"}?tab=library`} style={{ marginRight: 12, opacity: 0.6 }}>‹</Link>书籍</h1><p>{books.length} 本</p></div></div>
+        <div className="poster-wall">{books.map((entry) => <BookPosterCard entry={entry} storageId={storageId} key={entry.book.id} />)}</div>
       </section>
     );
   }
@@ -529,6 +611,33 @@ async function LibrarySurface({ mediaType, filter, storageId }: { mediaType: str
         ))}
       </div>
     </section>
+  );
+}
+
+function BookCategoryRow({ books, storageId }: { books: BookLibraryEntry[]; storageId?: string | undefined }) {
+  if (books.length === 0) return null;
+  const basePath = storageId ? `/w/${storageId}` : "/";
+  return (
+    <div className="category-section">
+      <Link className="category-header" href={`${basePath}?tab=library&type=book`}><h2>书籍 {books.length}</h2><span className="category-arrow">›</span></Link>
+      <div className="poster-row">{books.map((entry) => <BookPosterCard entry={entry} storageId={storageId} key={entry.book.id} />)}</div>
+    </div>
+  );
+}
+
+function BookPosterCard({ entry, storageId }: { entry: BookLibraryEntry; storageId?: string | undefined }) {
+  const href = `/book/${entry.book.id}${storageId ? `?w=${encodeURIComponent(storageId)}` : ""}`;
+  return (
+    <Link className="wall-card" href={href}>
+      <span className="wall-poster">
+        {entry.book.coverUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={entry.book.coverUrl} alt="" loading="lazy" />
+        ) : <span className="poster-fallback">{entry.book.title.slice(0, 4)}</span>}
+        <span className="wall-states"><span className={`wall-state tone-${entry.status === "saved" ? "green" : "amber"}`} title={entry.status === "saved" ? "已入库" : "转存处理中"}>{entry.status === "saved" ? <CheckCircle2 size={13} aria-hidden /> : <Clock3 size={13} aria-hidden />}</span></span>
+      </span>
+      <span className="wall-copy"><strong>{entry.book.title}</strong><span>{entry.book.authors.join("、") || "作者未知"} · {entry.status === "saved" ? "已入库" : "转存处理中"}</span></span>
+    </Link>
   );
 }
 

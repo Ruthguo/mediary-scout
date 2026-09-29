@@ -15,9 +15,11 @@ import { useRouter } from "next/navigation";
 export function SearchForm({
   basePath = "/",
   defaultQuery = "",
+  kind = "media",
 }: {
   basePath?: string;
   defaultQuery?: string;
+  kind?: "media" | "book";
 }) {
   const router = useRouter();
   return (
@@ -28,10 +30,11 @@ export function SearchForm({
       onSubmit={(event) => {
         event.preventDefault();
         const value = String(new FormData(event.currentTarget).get("q") ?? "");
-        router.push(`${basePath}?tab=search&q=${encodeURIComponent(value)}`);
+        router.push(`${basePath}?tab=search&kind=${kind}&q=${encodeURIComponent(value)}`);
       }}
     >
       <input type="hidden" name="tab" value="search" />
+      <input type="hidden" name="kind" value={kind} />
       <label className="search-box search-box-large">
         <Search size={18} aria-hidden />
         {/* key forces a remount when the URL query changes (back/forward, or a
@@ -40,8 +43,8 @@ export function SearchForm({
         <input
           key={defaultQuery}
           name="q"
-          aria-label="搜索媒体"
-          placeholder="片名 / 剧名"
+          aria-label={kind === "book" ? "搜索书籍资源" : "搜索媒体"}
+          placeholder={kind === "book" ? "书名 / 作者" : "片名 / 剧名"}
           defaultValue={defaultQuery}
         />
       </label>
