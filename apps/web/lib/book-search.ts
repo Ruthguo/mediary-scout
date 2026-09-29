@@ -1,4 +1,4 @@
-import type { ResourceCandidate, ResourceType } from "@media-track/workflow";
+import { normalizeTitleForContainment, type ResourceCandidate, type ResourceType } from "@media-track/workflow";
 import { getAccountScopedSettings, getCurrentAccountId, PANSOU_BASE_URL_SETTING_KEY } from "./workflow-runtime";
 import { buildPanSouProviderChain, resolveUserPanSouBaseUrl } from "./pansou-chain";
 
@@ -33,6 +33,15 @@ function bookLink(candidate: ResourceCandidate): BookLink | null {
   };
 }
 
+/** PanSou is a general media index and may return unrelated short dramas for a
+ *  book query. Only expose results naming the work AND an ebook format/label. */
+export function isBookResourceTitle(candidateTitle: string, bookTitle: string): boolean {
+  const name = normalizeTitleForContainment(bookTitle);
+  const candidate = normalizeTitleForContainment(candidateTitle);
+  if (name.length < 2 || !candidate.includes(name)) return false;
+  return /(?:epub|mobi|azw3?|pdf|djvu|fb2|电子书|电子版|图书|书籍|小说|kindle)/i.test(candidateTitle);
+}
+
 export async function searchBookLinks(query: string): Promise<BookSearchResult> {
   const keyword = query.trim().slice(0, 120);
   if (!keyword) return { links: [], status: "healthy" };
@@ -46,7 +55,11 @@ export async function searchBookLinks(query: string): Promise<BookSearchResult> 
   try {
     const snapshot = await provider.search({ keyword });
     return {
-      links: snapshot.candidates.map(bookLink).filter((link): link is BookLink => link !== null).slice(0, 80),
+      links: snapshot.candidates
+        .filter((candidate) => isBookResourceTitle(candidate.title, keyword))
+        .map(bookLink)
+        .filter((link): link is BookLink => link !== null)
+        .slice(0, 80),
       status: snapshot.sourceHealth?.status ?? "healthy",
     };
   } catch {
