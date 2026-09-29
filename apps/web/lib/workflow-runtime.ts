@@ -125,18 +125,21 @@ let fakeStorageExecutor: StorageExecutor | null = null;
 // accounts with different LLM configs each keep their own built model — a single
 // slot would thrash between accounts in multi-user mode.
 const agentModelCache = new Map<string, ReturnType<typeof createAgentModelFromEnv>>();
-const pendingBookActivities = new Map<string, { runId: string; title: string; authors: string; coverUrl: string | null; accountId: string; storageId: string; activity: string }>();
+const pendingBookActivities = new Map<string, { runId: string; title: string; authors: string; coverUrl: string | null; accountId: string; storageId: string; activity: string; status: "pending" | "saved"; updatedAt: number }>();
 export function listPendingBookActivities(accountId: string, storageId: string | null) {
   return [...pendingBookActivities.values()]
-    .filter((item) => item.accountId === accountId && item.storageId === (storageId ?? ""))
-    .map(({ accountId: _accountId, storageId: _storageId, ...item }) => ({ ...item, status: "pending" as const }));
+    .filter((item) => item.accountId === accountId && item.storageId === (storageId ?? "") && Date.now() - item.updatedAt < 10 * 60_000)
+    .map(({ accountId: _accountId, storageId: _storageId, updatedAt: _updatedAt, ...item }) => item);
 }
 export function startBookActivity(input: { book: BookTitle; accountId: string; storageId: string }) {
   const runId = `book_${crypto.randomUUID()}`;
-  pendingBookActivities.set(runId, { runId, title: input.book.title, authors: input.book.authors.join("、") || "作者未知", coverUrl: input.book.coverUrl, accountId: input.accountId, storageId: input.storageId, activity: "正在筛选电子书资源…" });
+  pendingBookActivities.set(runId, { runId, title: input.book.title, authors: input.book.authors.join("、") || "作者未知", coverUrl: input.book.coverUrl, accountId: input.accountId, storageId: input.storageId, activity: "正在筛选电子书资源…", status: "pending", updatedAt: Date.now() });
   return runId;
 }
-export function finishBookActivity(runId: string) { pendingBookActivities.delete(runId); }
+export function finishBookActivity(runId: string, status: "saved" | "pending" = "saved") {
+  const item = pendingBookActivities.get(runId);
+  if (item) pendingBookActivities.set(runId, { ...item, status, activity: status === "saved" ? "书籍已转存完成" : "正在等待网盘完成转存…", updatedAt: Date.now() });
+}
 
 /** The Postgres connection string for durable dev/prod state. SQLite has been
  *  retired — dev runs on OrbStack Postgres. */

@@ -88,14 +88,14 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
 
       {view.books.length > 0 ? (
         <section className="act-section">
-          <div className="act-section-head act-section-head-static">书籍转存中</div>
+          <div className="act-section-head act-section-head-static">书籍获取</div>
           {view.books.map((book) => (
             <div className="act-row act-row-active" key={book.runId}>
               {book.coverUrl ? <img className="act-poster" src={book.coverUrl} alt="" /> : <span className="act-poster act-poster-fallback tone-info">书</span>}
               <div className="act-row-body">
                 <div className="act-row-head"><strong>{book.title}</strong><span className="act-sub">{book.authors}</span></div>
                 <div className="act-bar"><div className="act-bar-fill" style={{ width: "55%" }} /></div>
-                <div className="act-ticker-row"><Loader2 size={14} className="act-spin" aria-hidden /><Ticker text={book.activity} /></div>
+                <div className="act-ticker-row">{book.status === "pending" ? <Loader2 size={14} className="act-spin" aria-hidden /> : <CheckCircle2 size={14} aria-hidden />}<Ticker text={book.activity} /></div>
               </div>
             </div>
           ))}

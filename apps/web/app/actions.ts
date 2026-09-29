@@ -49,13 +49,14 @@ export async function requestBookAction(input: {
     if (selected === null) return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
     const link = candidates[selected]!;
     const saved = await transferBookResource({ ...link, book, query: book.title, storageId: input.storageId });
+    finishBookActivity(activityId, saved.status === "saved" ? "saved" : "pending");
     revalidatePath("/");
     revalidatePath(`/book/${book.id}`);
     return saved;
   } catch (error) {
     return { status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" };
   } finally {
-    finishBookActivity(activityId);
+    finishBookActivity(activityId, "pending");
   }
 }
 

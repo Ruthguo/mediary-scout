@@ -67,7 +67,7 @@ export interface ActivityBookItem {
   title: string;
   authors: string;
   coverUrl: string | null;
-  status: "pending";
+  status: "pending" | "saved";
   activity: string;
 }
 
@@ -112,7 +112,7 @@ export async function getActivityView(input: {
         title: entry.book.title,
         authors: entry.book.authors.join("、") || "作者未知",
         coverUrl: entry.book.coverUrl,
-        status: "pending" as const,
+      status: "pending" as const,
         activity: "正在等待网盘完成转存…",
       })),
   ]
