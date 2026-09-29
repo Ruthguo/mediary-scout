@@ -30,8 +30,15 @@ async function BookContent({
   const saved = await refreshPendingBookEntry(bookId, storageId);
   const query = typeof values.q === "string" ? values.q.slice(0, 120) : "";
   let book = saved?.book ?? null;
-  if (!book && query) {
-    try { book = (await searchBooks(query)).find((item) => item.id === bookId) ?? null; } catch { /* detail fallback below */ }
+  // A library entry may have been created before Douban detail fetching was
+  // added. Refresh metadata on the detail page and merge it with the durable
+  // entry so old entries gain their cover/description without losing state.
+  const metadataQuery = query || saved?.book.title || "";
+  if (metadataQuery) {
+    try {
+      const latest = (await searchBooks(metadataQuery)).find((item) => item.id === bookId) ?? null;
+      if (latest) book = book ? { ...latest, ...book, description: book.description || latest.description, coverUrl: book.coverUrl || latest.coverUrl, sourceUrl: book.sourceUrl || latest.sourceUrl } : latest;
+    } catch { /* detail fallback below */ }
   }
   if (!book) {
     try { book = await getBookMetadata(bookId, query); } catch { /* show unavailable state */ }
