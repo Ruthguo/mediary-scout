@@ -211,6 +211,7 @@ async function BookSearchResults({ query, storageId }: { query: string; storageI
                     <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} initialStatus={savedById.get(book.id)?.status} />
                   </div>
                 </div>
+                {book.description ? <p className="candidate-overview book-card-description">{book.description}</p> : null}
                 <div className="candidate-meta">
                   {savedById.has(book.id) ? <span className="hub-badge tone-green">{savedById.get(book.id)?.status === "saved" ? "已入库" : "转存处理中"}</span> : <span>电子书资源</span>}
                 </div>
