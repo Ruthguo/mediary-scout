@@ -5,6 +5,7 @@
   "dependencies": {
     "@media-track/workflow": "*",
     "@vercel/analytics": "^2.0.1",
+    "cheerio": "^1.0.0",
     "undici": "^7.28.0"
   }
 }

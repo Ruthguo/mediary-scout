@@ -1,4 +1,5 @@
 import type { BookTitle } from "@media-track/workflow";
+import { load } from "cheerio";
 
 const SEARCH_URL = "https://book.douban.com/j/subject_suggest";
 const cache = new Map<string, { expiresAt: number; books: BookTitle[] }>();
@@ -35,7 +36,16 @@ export async function searchBooks(query: string): Promise<BookTitle[]> {
   const books = Array.isArray(body)
     ? body.map((row) => (row && typeof row === "object" ? mapBook(row as DoubanBook) : null)).filter((book): book is BookTitle => book !== null)
     : [];
-  const result = books.length > 0 ? books : [{
+  const result = books.length > 0 ? await Promise.all(books.map(async (book) => {
+    try {
+      const html = await fetch(book.sourceUrl, { signal: AbortSignal.timeout(8_000), headers: { Accept: "text/html", "User-Agent": "MediaryScout/1.0" } }).then((response) => response.ok ? response.text() : "");
+      const document = load(html);
+      const description = document("#link-report .intro").first().text(" ").replace(/\s+/g, " ").trim();
+      return description ? { ...book, description: description.slice(0, 900) } : book;
+    } catch {
+      return book;
+    }
+  })) : [{
     id: `query_${encodeURIComponent(keyword)}`,
     title: keyword,
     authors: [],
