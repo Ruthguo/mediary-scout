@@ -126,26 +126,6 @@ let fakeStorageExecutor: StorageExecutor | null = null;
 // accounts with different LLM configs each keep their own built model — a single
 // slot would thrash between accounts in multi-user mode.
 const agentModelCache = new Map<string, ReturnType<typeof createAgentModelFromEnv>>();
-const pendingBookActivities = new Map<string, { runId: string; title: string; authors: string; coverUrl: string | null; accountId: string; storageId: string; activity: string; status: "pending" | "saved"; updatedAt: number }>();
-export function listPendingBookActivities(accountId: string, storageId: string | null) {
-  return [...pendingBookActivities.values()]
-    .filter((item) => item.accountId === accountId && item.storageId === (storageId ?? "") && Date.now() - item.updatedAt < 10 * 60_000)
-    .map(({ accountId: _accountId, storageId: _storageId, updatedAt: _updatedAt, ...item }) => item);
-}
-export function startBookActivity(input: { book: BookTitle; accountId: string; storageId: string }) {
-  const runId = `book_${crypto.randomUUID()}`;
-  pendingBookActivities.set(runId, { runId, title: input.book.title, authors: input.book.authors.join("、") || "作者未知", coverUrl: input.book.coverUrl, accountId: input.accountId, storageId: input.storageId, activity: "正在筛选电子书资源…", status: "pending", updatedAt: Date.now() });
-  return runId;
-}
-export function finishBookActivity(runId: string, status: "saved" | "pending" | "failed" = "saved") {
-  const item = pendingBookActivities.get(runId);
-  if (status === "failed") {
-    pendingBookActivities.delete(runId);
-    return;
-  }
-  if (item) pendingBookActivities.set(runId, { ...item, status, activity: status === "saved" ? "书籍已转存完成" : "正在等待网盘完成转存…", updatedAt: Date.now() });
-}
-
 /** The Postgres connection string for durable dev/prod state. SQLite has been
  *  retired — dev runs on OrbStack Postgres. */
 export function postgresConnectionString(): string {
@@ -885,7 +865,77 @@ export async function queueCandidateTracking(
  * Returns the requeued count (terminal-failed runs are not counted).
  */
 export async function recoverOrphanedRuns(): Promise<number> {
-  return getWorkflowRepository().requeueRunningWorkflowRuns();
+  const repository = getWorkflowRepository();
+  return (await repository.requeueRunningWorkflowRuns()) + (await repository.recoverRunningBookEntries());
+}
+
+async function runNextQueuedBook(): Promise<{ status: "idle" | "succeeded" | "failed" }> {
+  const repository = getWorkflowRepository();
+  const entry = await repository.claimNextQueuedBookEntry();
+  if (!entry) return { status: "idle" };
+  const scope = { accountId: entry.accountId, connectedStorageId: entry.connectedStorageId };
+  const { getBookMetadata, searchBooks } = await import("./book-metadata");
+  const { searchBookLinks } = await import("./book-search");
+  const { isRetryableBookShareFailure } = await import("./book-transfer-retry");
+  let book = entry.book;
+  let message = "未找到可直接读取的电子书资源。";
+  try {
+    book = await getBookMetadata(book.id, book.title) ?? (await searchBooks(book.title)).find((item) => item.id === book.id) ?? book;
+    const result = await searchBookLinks(book.title, entry.accountId);
+    if (result.status === "unreachable" || result.status === "protocol_error") throw new Error("资源搜索源暂时不可用，请稍后重试。");
+    const drive = (await repository.listConnectedStorages(entry.accountId)).find((item) => item.id === entry.connectedStorageId);
+    if (!drive || !isRegisteredStorageProvider(drive.provider)) throw new Error("当前网盘不可用，请重新连接。");
+    const allowed = new Set(allowedResourceTypesForKinds(getStorageBrand(drive.provider).resourceProviderKinds));
+    const candidates = result.links.filter((link) => link.type !== "magnet" && allowed.has(link.type)).slice(0, 40);
+    if (!candidates.length) message = "暂未找到这本书的资源。";
+    else {
+      const selected = await selectBookResource({ book, candidates, accountId: entry.accountId });
+      if (!selected.length) message = "Agent 未找到可信的电子书资源。";
+      let sawArchive = false;
+      let sawDeadShare = false;
+      for (const index of selected) {
+        const candidate = candidates[index];
+        if (!candidate) continue;
+        const saved = await transferBookResource({ ...candidate, book, query: book.title, accountId: entry.accountId, storageId: entry.connectedStorageId });
+        if (saved.status === "saved" || (saved.status === "pending" && !saved.message.includes("继续尝试其他资源"))) {
+          return { status: "succeeded" };
+        }
+        if (saved.status === "pending") sawArchive = true;
+        if (saved.status === "failed" && isRetryableBookShareFailure(saved.message)) sawDeadShare = true;
+      }
+      if (sawArchive) message = "仅找到压缩包，未找到可直接读取的电子书资源。";
+      else if (sawDeadShare) message = "找到的电子书分享均已失效或受限。";
+    }
+  } catch (error) {
+    message = error instanceof Error ? error.message : "获取失败，请稍后重试。";
+    console.error(`[book-worker] ${book.id}: ${message}`);
+  }
+  const current = await repository.getBookEntry(book.id, scope);
+  await repository.saveBookEntry({ ...(current ?? entry), book, status: "failed", message, updatedAt: new Date().toISOString() });
+  return { status: "failed" };
+}
+
+async function checkNextPendingBook(): Promise<{ status: "idle" | "succeeded" | "failed" }> {
+  const repository = getWorkflowRepository();
+  const entry = await repository.claimNextPendingBookEntry(new Date(Date.now() - 30_000).toISOString());
+  if (!entry) return { status: "idle" };
+  const scope = { accountId: entry.accountId, connectedStorageId: entry.connectedStorageId };
+  try {
+    const executor = await getWorkerStorageExecutor(entry.accountId, entry.connectedStorageId);
+    const files = entry.directoryId ? await executor.listTree({ directoryId: entry.directoryId }) : [];
+    const ebookFiles = files.filter((file) => /\.(epub|azw3?|mobi|txt|pdf|cbz|cbr)$/i.test(file.path));
+    const current = await repository.getBookEntry(entry.book.id, scope);
+    if (!current || current.status !== "pending") return { status: "succeeded" };
+    if (ebookFiles.length) {
+      await repository.saveBookEntry({ ...current, status: "saved", fileCount: files.length, updatedAt: new Date().toISOString() });
+    } else if (Date.now() - Date.parse(entry.pendingSince ?? entry.updatedAt) >= 15 * 60_000) {
+      await repository.saveBookEntry({ ...current, status: "failed", message: "网盘转存等待超时，未发现可直接读取的电子书；请重新获取。", updatedAt: new Date().toISOString() });
+    }
+    return { status: "succeeded" };
+  } catch (error) {
+    console.warn(`[book-worker] pending check failed: ${error instanceof Error ? error.message : String(error)}`);
+    return { status: "failed" };
+  }
 }
 
 /**
@@ -1005,6 +1055,10 @@ export function __resetPanSouHealthCacheForTests(): void {
 
 export async function runNextQueuedWorkflow() {
   const repository = getWorkflowRepository();
+  const book = await runNextQueuedBook();
+  if (book.status !== "idle") return book;
+  const pendingBook = await checkNextPendingBook();
+  if (pendingBook.status !== "idle") return pendingBook;
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
   // The base deps below are the default account's, used as the fallback the
@@ -2609,6 +2663,7 @@ async function getWorkerStorageExecutor(
  * their own folder: the video acquisition workflow's completion checks cannot
  * recognise ebooks, but the executor's share ingest and full-tree read can. */
 export async function transferBookResource(input: {
+  accountId?: string;
   storageId?: string | undefined;
   query: string;
   url: string;
@@ -2617,7 +2672,7 @@ export async function transferBookResource(input: {
   title: string;
   book: BookTitle;
 }): Promise<{ status: "saved" | "pending" | "unsupported" | "failed"; message: string }> {
-  const accountId = await requireAuthenticatedAccountId();
+  const accountId = input.accountId ?? await requireAuthenticatedAccountId();
   const choice = await resolveQueueStorage(accountId, input.storageId);
   if (choice.unknown || !choice.id) return { status: "unsupported", message: "请先连接网盘。" };
   if (choice.frozen) return { status: "unsupported", message: "该网盘已掉线，请先重新连接。" };
@@ -2639,8 +2694,8 @@ export async function transferBookResource(input: {
     ?? await executor.createDirectory({ name: "Books", parentId: creds.rootCid });
   const folderLabel = [input.book.title.trim(), input.book.authors[0]?.trim()].filter(Boolean).join(" - ");
   const folderName = folderLabel.replace(/[\\/:*?"<>|\r\n]/g, " ").slice(0, 80) || "书籍";
-  const targetDir = existing?.directoryId
-    ?? (await executor.listChildDirectories(booksDir)).find((dir) => dir.name === folderName)?.id
+  const targetDir = (existing?.directoryId
+    || (await executor.listChildDirectories(booksDir)).find((dir) => dir.name === folderName)?.id)
     ?? await executor.createDirectory({ name: folderName, parentId: booksDir });
   const runId = `book_${crypto.randomUUID()}`;
   const candidate: ResourceCandidate = {
@@ -2659,6 +2714,7 @@ export async function transferBookResource(input: {
     accountId,
     connectedStorageId: choice.id,
     status: "pending",
+    pendingSince: existing?.pendingSince ?? new Date().toISOString(),
     directoryId: targetDir,
     directoryPath: `Books/${folderName}`,
     fileCount: 0,
@@ -2677,6 +2733,7 @@ export async function transferBookResource(input: {
     accountId,
     connectedStorageId: choice.id,
     status: ebookFiles.length > 0 ? "saved" : "pending",
+    pendingSince: existing?.pendingSince ?? new Date().toISOString(),
     directoryId: targetDir,
     directoryPath: `Books/${folderName}`,
     fileCount: files.length,
@@ -2692,10 +2749,11 @@ export async function transferBookResource(input: {
  * resource labels, never raw URLs; its selected index is checked against the
  * server-side candidate list before any privileged transfer. */
 export async function selectBookResource(input: {
+  accountId?: string;
   book: BookTitle;
   candidates: Array<{ title: string; type: ResourceType; source: string; evidence?: string }>;
 }): Promise<number[]> {
-  const accountId = await requireAuthenticatedAccountId();
+  const accountId = input.accountId ?? await requireAuthenticatedAccountId();
   const { model } = await getAgentModel(getAccountScopedSettings(accountId));
   const rows = input.candidates.slice(0, 40).map((candidate, index) => {
     const evidence = candidate.evidence?.replace(/\s+/g, " ").trim().slice(0, 500);
@@ -2726,6 +2784,7 @@ export async function refreshPendingBookEntry(bookId: string, storageId?: string
   const repository = getWorkflowRepository();
   const entry = await repository.getBookEntry(bookId, scope);
   if (!entry || entry.status !== "pending") return entry;
+  if (!entry.directoryId) return entry;
   try {
     const executor = await getWorkerStorageExecutor(scope.accountId, entry.connectedStorageId);
     const files = await executor.listTree({ directoryId: entry.directoryId });

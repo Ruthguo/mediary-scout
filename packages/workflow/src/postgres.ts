@@ -483,6 +483,73 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
     );
   }
 
+  async queueBookEntry(entry: BookLibraryEntry): Promise<BookLibraryEntry> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{ payload: BookLibraryEntry }>(
+      `INSERT INTO book_entries (account_id, connected_storage_id, book_id, updated_at, payload)
+       VALUES ($1, $2, $3, $4, $5::jsonb)
+       ON CONFLICT (account_id, connected_storage_id, book_id)
+       DO UPDATE SET updated_at = EXCLUDED.updated_at, payload = EXCLUDED.payload
+       WHERE book_entries.payload->>'status' = 'failed'
+       RETURNING payload`,
+      [entry.accountId, entry.connectedStorageId, entry.book.id, entry.updatedAt, JSON.stringify(entry)],
+    );
+    return result.rows[0]?.payload ?? (await this.getBookEntry(entry.book.id, entry))!;
+  }
+
+  async claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null> {
+    await this.ensureSchema();
+    return this.withTransaction(async (client) => {
+      const result = await client.query<{ payload: BookLibraryEntry }>(
+        `SELECT payload FROM book_entries WHERE payload->>'status' = 'queued'
+         ORDER BY updated_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`,
+      );
+      const entry = result.rows[0]?.payload;
+      if (!entry) return null;
+      const claimed = { ...entry, status: "running" as const, updatedAt: new Date().toISOString() };
+      await client.query(
+        `UPDATE book_entries SET payload = $1::jsonb, updated_at = $2
+         WHERE account_id = $3 AND connected_storage_id = $4 AND book_id = $5`,
+        [JSON.stringify(claimed), claimed.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id],
+      );
+      return claimed;
+    });
+  }
+
+  async claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null> {
+    await this.ensureSchema();
+    return this.withTransaction(async (client) => {
+      const result = await client.query<{ payload: BookLibraryEntry }>(
+        `SELECT payload FROM book_entries WHERE payload->>'status' = 'pending' AND updated_at < $1
+         ORDER BY updated_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED`, [olderThan],
+      );
+      const entry = result.rows[0]?.payload;
+      if (!entry) return null;
+      const updated = { ...entry, pendingSince: entry.pendingSince ?? entry.updatedAt, updatedAt: new Date().toISOString() };
+      await client.query(`UPDATE book_entries SET payload = $1::jsonb, updated_at = $2 WHERE account_id = $3 AND connected_storage_id = $4 AND book_id = $5`,
+        [JSON.stringify(updated), updated.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id]);
+      return entry;
+    });
+  }
+
+  async recoverRunningBookEntries(): Promise<number> {
+    await this.ensureSchema();
+    return this.withTransaction(async (client) => {
+      const rows = await client.query<{ payload: BookLibraryEntry }>(
+        `SELECT payload FROM book_entries WHERE payload->>'status' = 'running' FOR UPDATE`,
+      );
+      let recovered = 0;
+      for (const { payload: entry } of rows.rows) {
+        const attempts = (entry.attempts ?? 0) + 1;
+        const updated = { ...entry, attempts, status: attempts >= 5 ? "failed" : "queued", message: attempts >= 5 ? "任务多次中断，请重新获取。" : entry.message, updatedAt: new Date().toISOString() };
+        await client.query(`UPDATE book_entries SET payload = $1::jsonb, updated_at = $2 WHERE account_id = $3 AND connected_storage_id = $4 AND book_id = $5`,
+          [JSON.stringify(updated), updated.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id]);
+        if (attempts < 5) recovered++;
+      }
+      return recovered;
+    });
+  }
+
   async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {
     if (!scope.connectedStorageId) return false;
     await this.ensureSchema();

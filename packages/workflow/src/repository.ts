@@ -201,6 +201,10 @@ export type WorkflowRunReservationResult =
 
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveBookEntry(entry: BookLibraryEntry): Promise<void>;
+  queueBookEntry(entry: BookLibraryEntry): Promise<BookLibraryEntry>;
+  claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null>;
+  claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null>;
+  recoverRunningBookEntries(): Promise<number>;
   deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean>;
   getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null>;
   listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]>;
@@ -415,6 +419,40 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
 
   async saveBookEntry(entry: BookLibraryEntry): Promise<void> {
     this.books.set(`${entry.accountId}\u0000${entry.connectedStorageId}\u0000${entry.book.id}`, cloneWorkflowValue(entry));
+  }
+
+  async queueBookEntry(entry: BookLibraryEntry): Promise<BookLibraryEntry> {
+    const key = `${entry.accountId}\u0000${entry.connectedStorageId}\u0000${entry.book.id}`;
+    const existing = this.books.get(key);
+    if (existing && ["queued", "running", "pending", "saved"].includes(existing.status)) return cloneWorkflowValue(existing);
+    this.books.set(key, cloneWorkflowValue(entry));
+    return cloneWorkflowValue(entry);
+  }
+
+  async claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null> {
+    const entry = [...this.books.values()].filter((item) => item.status === "queued").sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+    if (!entry) return null;
+    const claimed = { ...entry, status: "running" as const, updatedAt: new Date().toISOString() };
+    await this.saveBookEntry(claimed);
+    return cloneWorkflowValue(claimed);
+  }
+
+  async claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null> {
+    const entry = [...this.books.values()].filter((item) => item.status === "pending" && item.updatedAt < olderThan).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+    if (!entry) return null;
+    await this.saveBookEntry({ ...entry, pendingSince: entry.pendingSince ?? entry.updatedAt, updatedAt: new Date().toISOString() });
+    return cloneWorkflowValue(entry);
+  }
+
+  async recoverRunningBookEntries(): Promise<number> {
+    let recovered = 0;
+    for (const entry of this.books.values()) {
+      if (entry.status !== "running") continue;
+      const attempts = (entry.attempts ?? 0) + 1;
+      await this.saveBookEntry({ ...entry, attempts, status: attempts >= 5 ? "failed" : "queued", message: attempts >= 5 ? "任务多次中断，请重新获取。" : entry.message, updatedAt: new Date().toISOString() });
+      if (attempts < 5) recovered++;
+    }
+    return recovered;
   }
 
   async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {

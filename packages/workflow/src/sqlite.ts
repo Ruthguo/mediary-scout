@@ -339,6 +339,50 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     ).run(entry.accountId, entry.connectedStorageId, entry.book.id, entry.updatedAt, JSON.stringify(entry));
   }
 
+  async queueBookEntry(entry: BookLibraryEntry): Promise<BookLibraryEntry> {
+    const existing = await this.getBookEntry(entry.book.id, entry);
+    if (existing && existing.status !== "failed") return existing;
+    await this.saveBookEntry(entry);
+    return entry;
+  }
+
+  async claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null> {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT payload FROM book_entries WHERE json_extract(payload, '$.status') = 'queued' ORDER BY updated_at ASC LIMIT 1`).get() as { payload: string } | undefined;
+      if (!row) return null;
+      const entry = JSON.parse(row.payload) as BookLibraryEntry;
+      const claimed = { ...entry, status: "running" as const, updatedAt: new Date().toISOString() };
+      this.db.prepare(`UPDATE book_entries SET payload = ?, updated_at = ? WHERE account_id = ? AND connected_storage_id = ? AND book_id = ?`).run(JSON.stringify(claimed), claimed.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id);
+      return claimed;
+    })();
+  }
+
+  async claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null> {
+    return this.db.transaction(() => {
+      const row = this.db.prepare(`SELECT payload FROM book_entries WHERE json_extract(payload, '$.status') = 'pending' AND updated_at < ? ORDER BY updated_at ASC LIMIT 1`).get(olderThan) as { payload: string } | undefined;
+      if (!row) return null;
+      const entry = JSON.parse(row.payload) as BookLibraryEntry;
+      const updated = { ...entry, pendingSince: entry.pendingSince ?? entry.updatedAt, updatedAt: new Date().toISOString() };
+      this.db.prepare(`UPDATE book_entries SET payload = ?, updated_at = ? WHERE account_id = ? AND connected_storage_id = ? AND book_id = ?`).run(JSON.stringify(updated), updated.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id);
+      return entry;
+    })();
+  }
+
+  async recoverRunningBookEntries(): Promise<number> {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`SELECT payload FROM book_entries WHERE json_extract(payload, '$.status') = 'running'`).all() as Array<{ payload: string }>;
+      let recovered = 0;
+      for (const row of rows) {
+        const entry = JSON.parse(row.payload) as BookLibraryEntry;
+        const attempts = (entry.attempts ?? 0) + 1;
+        const updated = { ...entry, attempts, status: attempts >= 5 ? "failed" : "queued", message: attempts >= 5 ? "任务多次中断，请重新获取。" : entry.message, updatedAt: new Date().toISOString() };
+        this.db.prepare(`UPDATE book_entries SET payload = ?, updated_at = ? WHERE account_id = ? AND connected_storage_id = ? AND book_id = ?`).run(JSON.stringify(updated), updated.updatedAt, entry.accountId, entry.connectedStorageId, entry.book.id);
+        if (attempts < 5) recovered++;
+      }
+      return recovered;
+    })();
+  }
+
   async deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean> {
     if (!scope.connectedStorageId) return false;
     const result = this.db.prepare(

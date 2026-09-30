@@ -57,10 +57,10 @@ export function bookResourceRank(candidateTitle: string, bookTitle: string): num
   return score;
 }
 
-export async function searchBookLinks(query: string): Promise<BookSearchResult> {
+export async function searchBookLinks(query: string, accountId?: string): Promise<BookSearchResult> {
   const keyword = query.trim().slice(0, 120);
   if (!keyword) return { links: [], status: "healthy" };
-  const settings = getAccountScopedSettings(await getCurrentAccountId());
+  const settings = getAccountScopedSettings(accountId ?? await getCurrentAccountId());
   const provider = buildPanSouProviderChain({
     userBaseURL: resolveUserPanSouBaseUrl(await settings.getSetting(PANSOU_BASE_URL_SETTING_KEY)),
     // Offline magnets are currently confirmed by VIDEO landing in the storage

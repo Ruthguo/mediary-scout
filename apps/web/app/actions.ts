@@ -3,10 +3,6 @@
 import { revalidatePath } from "next/cache";
 import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "../lib/workflow-runtime";
 import { assertNotDemo } from "../lib/demo-mode";
-import { searchBookLinks } from "../lib/book-search";
-import { getBookMetadata, searchBooks } from "../lib/book-metadata";
-import { isRetryableBookShareFailure } from "../lib/book-transfer-retry";
-import { allowedResourceTypesForKinds, getStorageBrand, isRegisteredStorageProvider } from "@media-track/workflow";
 
 export async function requestBookAction(input: {
   query: string;
@@ -14,7 +10,7 @@ export async function requestBookAction(input: {
   storageId?: string | undefined;
 }): Promise<{ status: "saved" | "pending" | "unsupported" | "failed" | "no_coverage"; message: string }> {
   assertNotDemo();
-  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope, selectBookResource, transferBookResource, startBookActivity, finishBookActivity } = await import("../lib/workflow-runtime");
+  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope } = await import("../lib/workflow-runtime");
   await requireAuthenticatedAccountId();
   const query = input.query.trim();
   if (!query || query.length > 120) {
@@ -24,75 +20,17 @@ export async function requestBookAction(input: {
   const repository = getWorkflowRepository();
   const previous = await repository.getBookEntry(input.bookId, scope);
   if (previous?.status === "saved") return { status: "saved", message: "这本书已入库。" };
-  let book;
-  try {
-    book = await getBookMetadata(input.bookId, query) ?? (await searchBooks(query)).find((entry) => entry.id === input.bookId) ?? null;
-  } catch {
-    return { status: "failed", message: "书籍资料暂时不可用，请稍后重试。" };
-  }
-  if (!book) return { status: "unsupported", message: "书籍条目已更新，请重新搜索。" };
   const configError = await acquireLlmPreflightError(scope.accountId);
   if (configError) return { status: "unsupported", message: configError };
-  const result = await searchBookLinks(book.title);
-  if (result.status === "unreachable" || result.status === "protocol_error") {
-    return { status: "failed", message: "资源搜索源暂时不可用，请稍后重试。" };
-  }
-  const drive = (await repository.listConnectedStorages(scope.accountId)).find((item) => item.id === scope.connectedStorageId);
-  if (!drive || !isRegisteredStorageProvider(drive.provider)) {
-    return { status: "unsupported", message: "请先连接网盘。" };
-  }
-  const allowed = new Set(allowedResourceTypesForKinds(getStorageBrand(drive.provider).resourceProviderKinds));
-  const candidates = result.links.filter((link) => link.type !== "magnet" && allowed.has(link.type)).slice(0, 40);
-  if (candidates.length === 0) return { status: "no_coverage", message: "暂未找到这本书的资源。" };
-  const activityId = startBookActivity({ book, accountId: scope.accountId, storageId: scope.connectedStorageId ?? "" });
-  try {
-    const selected = await selectBookResource({ book, candidates });
-    if (selected.length === 0) {
-      finishBookActivity(activityId, "failed");
-      return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
-    }
-    const ordered = selected;
-    let lastPending: { status: "pending"; message: string } | null = null;
-    let lastDeadShare: { status: "failed"; message: string } | null = null;
-    for (const index of ordered) {
-      const saved = await transferBookResource({ ...candidates[index]!, book, query: book.title, storageId: input.storageId });
-      if (saved.status === "saved") {
-        finishBookActivity(activityId, "saved");
-        revalidatePath("/");
-        revalidatePath(`/book/${book.id}`);
-        return saved;
-      }
-      if (saved.status === "pending" && saved.message.includes("继续尝试其他资源")) {
-        lastPending = { status: "pending", message: saved.message };
-        continue;
-      }
-      if (saved.status === "failed" && isRetryableBookShareFailure(saved.message)) {
-        lastDeadShare = { status: "failed", message: saved.message };
-        continue;
-      }
-      finishBookActivity(activityId, "pending");
-      revalidatePath("/");
-      revalidatePath(`/book/${book.id}`);
-      return saved;
-    }
-    await repository.deleteBookEntry(book.id, scope);
-    const result = {
-      status: "no_coverage" as const,
-      message: lastPending
-        ? "仅找到压缩包，未找到可直接读取的电子书资源。"
-        : lastDeadShare
-          ? "找到的电子书分享均已失效或受限。"
-          : "未找到可直接读取的电子书资源。",
-    };
-    finishBookActivity(activityId, "failed");
-    revalidatePath("/");
-    revalidatePath(`/book/${book.id}`);
-    return result;
-  } catch (error) {
-    finishBookActivity(activityId, "failed");
-    await repository.deleteBookEntry(book.id, scope);
-    return { status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" };
-  }
+  if (!scope.connectedStorageId) return { status: "unsupported", message: "请先连接网盘。" };
+  const entry = await repository.queueBookEntry({
+    book: { id: input.bookId, title: query, authors: [], year: null, coverUrl: null, description: "", sourceUrl: "" },
+    accountId: scope.accountId, connectedStorageId: scope.connectedStorageId,
+    status: "queued", directoryId: "", directoryPath: "", fileCount: 0,
+    updatedAt: new Date().toISOString(),
+  });
+  revalidatePath("/");
+  return { status: entry.status === "saved" ? "saved" : "pending", message: entry.status === "saved" ? "这本书已入库。" : "已加入后台队列，完成后会通知你。" };
 }
 
 export async function untrackBookAction(input: { bookId: string; storageId?: string | undefined }): Promise<{ status: "untracked" | "not_found"; message: string }> {

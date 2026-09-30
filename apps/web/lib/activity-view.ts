@@ -8,7 +8,6 @@ import {
   type WorkflowRunProgress,
 } from "@media-track/workflow";
 import { activeRunLabel, distinctSeasons, seasonLabelText } from "./activity-season-label";
-import { listPendingBookActivities } from "./workflow-runtime";
 
 // Re-export the pure season-label helpers so existing server-side imports from
 // this module keep working. The CANONICAL home is the runtime-free
@@ -67,7 +66,7 @@ export interface ActivityBookItem {
   title: string;
   authors: string;
   coverUrl: string | null;
-  status: "pending" | "saved";
+  status: "pending" | "saved" | "failed";
   activity: string;
 }
 
@@ -103,20 +102,16 @@ export async function getActivityView(input: {
     isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
   const bookScope = scope ?? { accountId: "acct_default", connectedStorageId: null };
-  const books = [
-    ...listPendingBookActivities(bookScope.accountId, bookScope.connectedStorageId),
-    ...(await input.repository.listBookEntries(bookScope))
-      .filter((entry) => entry.status === "pending")
+  const books = (await input.repository.listBookEntries(bookScope))
+      .filter((entry) => entry.status !== "saved")
       .map((entry) => ({
         runId: `book_${entry.book.id}`,
         title: entry.book.title,
         authors: entry.book.authors.join("、") || "作者未知",
         coverUrl: entry.book.coverUrl,
-      status: "pending" as const,
-        activity: "正在等待网盘完成转存…",
-      })),
-  ]
-    .filter((item, index, all) => all.findIndex((candidate) => candidate.title === item.title) === index);
+        status: entry.status === "failed" ? "failed" as const : "pending" as const,
+        activity: entry.status === "queued" ? "正在排队获取…" : entry.status === "running" ? "正在查找电子书资源…" : entry.status === "failed" ? entry.message ?? "获取失败，请重试。" : "正在等待网盘完成转存…",
+      }));
 
   // Poster backfill source: older notifications predate report.posterPath, so a
   // completed item can lack a poster. The title is still tracked → source the

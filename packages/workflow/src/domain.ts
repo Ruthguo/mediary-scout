@@ -31,7 +31,10 @@ export interface BookLibraryEntry {
   book: BookTitle;
   accountId: string;
   connectedStorageId: string;
-  status: "pending" | "saved";
+  status: "queued" | "running" | "pending" | "saved" | "failed";
+  message?: string | undefined;
+  attempts?: number;
+  pendingSince?: string;
   directoryId: string;
   directoryPath: string;
   fileCount: number;

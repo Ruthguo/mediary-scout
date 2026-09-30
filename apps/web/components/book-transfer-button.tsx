@@ -17,7 +17,7 @@ export function BookTransferButton({
   query: string;
   bookId: string;
   storageId?: string | undefined;
-  initialStatus?: "pending" | "saved" | undefined;
+  initialStatus?: "queued" | "running" | "pending" | "saved" | "failed" | undefined;
   messageContainerId?: string | undefined;
 }) {
   const router = useRouter();
@@ -30,7 +30,7 @@ export function BookTransferButton({
   const [result, setResult] = useState<{ status: string; message: string } | null>(
     initialStatus === "saved"
       ? { status: "saved", message: "这本书已入库。" }
-      : initialStatus === "pending"
+      : initialStatus === "queued" || initialStatus === "running" || initialStatus === "pending"
         ? { status: "pending", message: "转存处理中。" }
         : null,
   );

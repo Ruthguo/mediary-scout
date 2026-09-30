@@ -501,7 +501,7 @@ function CandidateCard({
 
 async function LibrarySurface({ mediaType, filter, storageId }: { mediaType: string; filter: string; storageId?: string | undefined }) {
   const [rawWall, inProgress, bookScope] = await Promise.all([getLibraryWall(storageId), getInProgressTitles(storageId), getActiveWorkspaceScope(storageId)]);
-  const books = await getWorkflowRepository().listBookEntries(bookScope);
+  const books = (await getWorkflowRepository().listBookEntries(bookScope)).filter((entry) => entry.status !== "failed");
   const inProgressIds = new Set(inProgress.map((title) => title.tmdbId));
   // A title still being fetched shows as a 获取中 placeholder, not (yet) a card.
   const wall = rawWall.filter((entry) => !inProgressIds.has(entry.tmdbId));

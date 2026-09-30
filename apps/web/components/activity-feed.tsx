@@ -95,7 +95,7 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
               <div className="act-row-body">
                 <div className="act-row-head"><strong>{book.title}</strong><span className="act-sub">{book.authors}</span></div>
                 <div className="act-bar"><div className="act-bar-fill" style={{ width: "55%" }} /></div>
-                <div className="act-ticker-row">{book.status === "pending" ? <Loader2 size={14} className="act-spin" aria-hidden /> : <CheckCircle2 size={14} aria-hidden />}<Ticker text={book.activity} /></div>
+                <div className="act-ticker-row">{book.status === "pending" ? <Loader2 size={14} className="act-spin" aria-hidden /> : book.status === "saved" ? <CheckCircle2 size={14} aria-hidden /> : null}<Ticker text={book.activity} /></div>
               </div>
             </div>
           ))}
