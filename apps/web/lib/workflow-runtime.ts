@@ -1456,10 +1456,34 @@ export async function queueCandidateSeries(
 export const LAST_SWEEP_DATE_SETTING_KEY = "last_sweep_date";
 export const LAST_SWEEP_CLAIMS_SETTING_KEY = "last_sweep_claims";
 export const LAST_SWEEP_COMPLETED_AT_SETTING_KEY = "last_sweep_completed_at";
+export const LAST_SWEEP_RETRIES_SETTING_KEY = "last_sweep_retries";
+/** Prevent an infrastructure/configuration failure from spending LLM budget forever. */
+export const MAX_DAILY_SWEEP_RETRIES = 3;
 
 interface SweepClaims {
   date: string;
   slots: string[];
+}
+
+interface SweepRetries {
+  date: string;
+  attempts: number;
+}
+
+async function readSweepRetries(
+  repository: { getSetting(key: string): Promise<string | null> },
+  today: string,
+): Promise<number> {
+  const raw = (await repository.getSetting(LAST_SWEEP_RETRIES_SETTING_KEY))?.trim();
+  if (!raw) return 0;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SweepRetries>;
+    return parsed.date === today && Number.isFinite(parsed.attempts)
+      ? Math.max(0, Math.floor(parsed.attempts ?? 0))
+      : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /** 今天已认领的时间点。升级迁移：只有 legacy last_sweep_date=今天时，视「已到点
@@ -1516,7 +1540,7 @@ export async function runScheduledType3(options?: {
   force?: boolean;
 }): Promise<{
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "retry_limit_reached";
   scheduledFor?: string;
 }> {
   const repository = getWorkflowRepository();
@@ -1544,6 +1568,14 @@ export async function runScheduledType3(options?: {
     // catch 里回滚到 priorClaims，下一个 tick 重试今天而不是等到明天。
     claimDate = date;
     claimedNow = due;
+    const retryAttempts = await readSweepRetries(repository, date);
+    if (retryAttempts >= MAX_DAILY_SWEEP_RETRIES) {
+      await repository.setSetting(
+        LAST_SWEEP_CLAIMS_SETTING_KEY,
+        JSON.stringify({ date, slots: [...new Set([...priorClaims, ...due])].sort() }),
+      );
+      return { skipped: "retry_limit_reached", outcomes: [] };
+    }
     await repository.setSetting(
       LAST_SWEEP_CLAIMS_SETTING_KEY,
       JSON.stringify({ date, slots: [...new Set([...priorClaims, ...due])].sort() }),
@@ -1586,6 +1618,12 @@ export async function runScheduledType3(options?: {
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
+    if (!options?.force) {
+      await repository.setSetting(
+        LAST_SWEEP_RETRIES_SETTING_KEY,
+        JSON.stringify({ date: claimDate, attempts: 0 }),
+      );
+    }
     await pushNotificationsSince(repository, startedAt);
     return { outcomes: result };
   } catch (error) {
@@ -1595,10 +1633,22 @@ export async function runScheduledType3(options?: {
     // this only fires on infra-level errors.
     if (claimedNow.length > 0) {
       try {
+        const attempts = (await readSweepRetries(repository, claimDate)) + 1;
         await repository.setSetting(
-          LAST_SWEEP_CLAIMS_SETTING_KEY,
-          JSON.stringify({ date: claimDate, slots: priorClaims }),
+          LAST_SWEEP_RETRIES_SETTING_KEY,
+          JSON.stringify({ date: claimDate, attempts }),
         );
+        if (attempts >= MAX_DAILY_SWEEP_RETRIES) {
+          await repository.setSetting(
+            LAST_SWEEP_CLAIMS_SETTING_KEY,
+            JSON.stringify({ date: claimDate, slots: [...new Set([...priorClaims, ...claimedNow])].sort() }),
+          );
+        } else {
+          await repository.setSetting(
+            LAST_SWEEP_CLAIMS_SETTING_KEY,
+            JSON.stringify({ date: claimDate, slots: priorClaims }),
+          );
+        }
       } catch {
         // best-effort release; nothing else to do
       }
