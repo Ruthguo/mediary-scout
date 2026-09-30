@@ -4,6 +4,7 @@ import { buildPanSouProviderChain, resolveUserPanSouBaseUrl } from "./pansou-cha
 
 export interface BookLink {
   title: string;
+  evidence: string;
   type: ResourceType;
   source: string;
   url: string;
@@ -26,6 +27,7 @@ function bookLink(candidate: ResourceCandidate): BookLink | null {
   }
   return {
     title: candidate.title || "未命名资源",
+    evidence: typeof candidate.providerPayload.content === "string" ? candidate.providerPayload.content : "",
     type: candidate.type,
     source: candidate.source,
     url,

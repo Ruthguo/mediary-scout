@@ -88,6 +88,7 @@ describe("PanSouResourceProvider", () => {
             results: [
               {
                 title: "翘楚 S01E01 4K",
+                content: "file:翘楚 S01E01.mkv",
                 channel: "telegram-a",
                 links: [
                   {
@@ -144,6 +145,7 @@ describe("PanSouResourceProvider", () => {
           password: "pw1",
           datetime: "2026-06-11",
           rawType: "115",
+          content: "file:翘楚 S01E01.mkv",
         },
       }),
       expect.objectContaining({
@@ -156,6 +158,7 @@ describe("PanSouResourceProvider", () => {
           password: "",
           datetime: "",
           rawType: "magnet",
+          content: "file:翘楚 S01E01.mkv",
         },
       }),
       expect.objectContaining({
@@ -166,6 +169,39 @@ describe("PanSouResourceProvider", () => {
         source: "telegram-b",
       }),
     ]);
+  });
+
+  it("keeps the richest PanSou content when duplicate results share a URL", async () => {
+    const provider = new PanSouResourceProvider({
+      baseURL: "https://pansou.example",
+      maxSearchAttempts: 1,
+      fetchJson: async () => ({
+        code: 0,
+        data: {
+          results: [
+            {
+              title: "猫鱼 (陈冲)",
+              content: "",
+              channel: "first",
+              links: [{ type: "quark", url: "https://pan.quark.cn/s/same" }],
+            },
+            {
+              title: "猫鱼 (陈冲)",
+              content: "file:猫鱼 (陈冲).epub\nfile:猫鱼 (陈冲).azw3",
+              channel: "second",
+              links: [{ type: "quark", url: "https://pan.quark.cn/s/same" }],
+            },
+          ],
+        },
+      }),
+    });
+
+    const snapshot = await provider.search({ keyword: "猫鱼" });
+    expect(snapshot.candidates).toHaveLength(1);
+    expect(snapshot.candidates[0]?.providerPayload).toMatchObject({
+      url: "https://pan.quark.cn/s/same",
+      content: "file:猫鱼 (陈冲).epub\nfile:猫鱼 (陈冲).azw3",
+    });
   });
 
   it("recognizes quark links and filters candidates by allowedTypes (per-brand)", async () => {

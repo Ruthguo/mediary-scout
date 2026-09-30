@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
+import { createPortal } from "react-dom";
 import { Check, LoaderCircle, Plus } from "lucide-react";
 import { requestBookAction } from "../app/actions";
 import { untrackBookAction } from "../app/actions";
@@ -11,15 +12,21 @@ export function BookTransferButton({
   bookId,
   storageId,
   initialStatus,
+  messageContainerId,
 }: {
   query: string;
   bookId: string;
   storageId?: string | undefined;
   initialStatus?: "pending" | "saved" | undefined;
+  messageContainerId?: string | undefined;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
   const [untrackError, setUntrackError] = useState<string | null>(null);
+  const [messageContainer, setMessageContainer] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (messageContainerId) setMessageContainer(document.getElementById(messageContainerId));
+  }, [messageContainerId]);
   const [result, setResult] = useState<{ status: string; message: string } | null>(
     initialStatus === "saved"
       ? { status: "saved", message: "这本书已入库。" }
@@ -47,7 +54,10 @@ export function BookTransferButton({
         {pending ? <LoaderCircle size={16} className="spin" aria-hidden /> : <Plus size={16} aria-hidden />}
         {pending ? "获取中" : result?.status === "saved" ? "已获取" : result?.status === "pending" ? "已提交" : "获取"}
       </button>
-      {result ? <span className={`book-action-message${result.status === "failed" ? " is-error" : ""}`} role={result.status === "failed" ? "alert" : "status"}>{result.message}</span> : null}
+      {result ? (() => {
+        const message = <span className={`book-action-message${result.status === "failed" ? " is-error" : ""}`} role={result.status === "failed" ? "alert" : "status"}>{result.message}</span>;
+        return messageContainerId ? messageContainer ? createPortal(message, messageContainer) : null : message;
+      })() : null}
     </div>
   );
 }

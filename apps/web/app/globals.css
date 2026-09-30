@@ -611,9 +611,10 @@ p {
 
 .book-actions {
   display: flex;
+  flex-direction: row;
   align-items: center;
-  flex-wrap: wrap;
   gap: 8px;
+  max-width: 100%;
 }
 
 .book-actions .secondary-button {
@@ -623,7 +624,10 @@ p {
 }
 
 .book-actions .book-action-message {
-  flex: 0 0 100%;
+  flex: 0 1 auto;
+  width: auto;
+  max-width: min(360px, 100%);
+  text-align: right;
   min-width: 0;
   color: var(--text-muted);
   font-size: 12px;
@@ -631,6 +635,21 @@ p {
 }
 
 .book-actions .book-action-message.is-error {
+  color: var(--negative);
+}
+
+.book-card-message:empty {
+  display: none;
+}
+
+.book-card-message .book-action-message {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.book-card-message .book-action-message.is-error {
   color: var(--negative);
 }
 

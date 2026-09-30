@@ -5,6 +5,7 @@ import { queueCandidateSeries, queueCandidateTracking, reserveCandidate } from "
 import { assertNotDemo } from "../lib/demo-mode";
 import { searchBookLinks } from "../lib/book-search";
 import { getBookMetadata, searchBooks } from "../lib/book-metadata";
+import { isRetryableBookShareFailure } from "../lib/book-transfer-retry";
 import { allowedResourceTypesForKinds, getStorageBrand, isRegisteredStorageProvider } from "@media-track/workflow";
 
 export async function requestBookAction(input: {
@@ -46,17 +47,51 @@ export async function requestBookAction(input: {
   const activityId = startBookActivity({ book, accountId: scope.accountId, storageId: scope.connectedStorageId ?? "" });
   try {
     const selected = await selectBookResource({ book, candidates });
-    if (selected === null) return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
-    const link = candidates[selected]!;
-    const saved = await transferBookResource({ ...link, book, query: book.title, storageId: input.storageId });
-    finishBookActivity(activityId, saved.status === "saved" ? "saved" : "pending");
+    if (selected.length === 0) {
+      finishBookActivity(activityId, "failed");
+      return { status: "no_coverage", message: "Agent 未找到可信的电子书资源。" };
+    }
+    const ordered = selected;
+    let lastPending: { status: "pending"; message: string } | null = null;
+    let lastDeadShare: { status: "failed"; message: string } | null = null;
+    for (const index of ordered) {
+      const saved = await transferBookResource({ ...candidates[index]!, book, query: book.title, storageId: input.storageId });
+      if (saved.status === "saved") {
+        finishBookActivity(activityId, "saved");
+        revalidatePath("/");
+        revalidatePath(`/book/${book.id}`);
+        return saved;
+      }
+      if (saved.status === "pending" && saved.message.includes("继续尝试其他资源")) {
+        lastPending = { status: "pending", message: saved.message };
+        continue;
+      }
+      if (saved.status === "failed" && isRetryableBookShareFailure(saved.message)) {
+        lastDeadShare = { status: "failed", message: saved.message };
+        continue;
+      }
+      finishBookActivity(activityId, "pending");
+      revalidatePath("/");
+      revalidatePath(`/book/${book.id}`);
+      return saved;
+    }
+    await repository.deleteBookEntry(book.id, scope);
+    const result = {
+      status: "no_coverage" as const,
+      message: lastPending
+        ? "仅找到压缩包，未找到可直接读取的电子书资源。"
+        : lastDeadShare
+          ? "找到的电子书分享均已失效或受限。"
+          : "未找到可直接读取的电子书资源。",
+    };
+    finishBookActivity(activityId, "failed");
     revalidatePath("/");
     revalidatePath(`/book/${book.id}`);
-    return saved;
+    return result;
   } catch (error) {
+    finishBookActivity(activityId, "failed");
+    await repository.deleteBookEntry(book.id, scope);
     return { status: "failed", message: error instanceof Error ? error.message : "转存失败，请稍后重试。" };
-  } finally {
-    finishBookActivity(activityId, "pending");
   }
 }
 

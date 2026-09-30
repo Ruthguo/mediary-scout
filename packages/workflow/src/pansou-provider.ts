@@ -77,6 +77,7 @@ export interface PanSouResourceProviderOptions {
 
 interface PanSouLinkFact {
   title: string;
+  content: string;
   source: string;
   type: ResourceType;
   rawType: string;
@@ -183,6 +184,7 @@ export class PanSouResourceProvider implements ResourceProvider {
         password: fact.password,
         datetime: fact.datetime,
         rawType: fact.rawType,
+        content: fact.content,
       },
     }));
 
@@ -272,13 +274,14 @@ function isPanSouSuccessResponse(value: unknown): value is {
 
 function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
   const facts: PanSouLinkFact[] = [];
-  const seenUrls = new Set<string>();
+  const factIndexByUrl = new Map<string, number>();
 
   for (const result of results) {
     if (!isRecord(result)) {
       continue;
     }
     const title = stringValue(result["title"]);
+    const content = stringValue(result["content"]);
     const source = stringValue(result["channel"]);
     const links = Array.isArray(result["links"]) ? result["links"] : [];
     for (const link of links) {
@@ -288,12 +291,22 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
       const rawType = stringValue(link["type"]);
       const url = stringValue(link["url"]);
       const type = normalizeResourceType(rawType, url);
-      if (!type || !url || seenUrls.has(url)) {
+      if (!type || !url) {
         continue;
       }
-      seenUrls.add(url);
+      const existingIndex = factIndexByUrl.get(url);
+      if (existingIndex !== undefined) {
+        const existing = facts[existingIndex]!;
+        if (panSouEvidenceScore(content) > panSouEvidenceScore(existing.content)) existing.content = content;
+        if (!existing.source && source) existing.source = source;
+        if (!existing.password) existing.password = stringValue(link["password"]);
+        if (!existing.datetime) existing.datetime = stringValue(link["datetime"]);
+        continue;
+      }
+      factIndexByUrl.set(url, facts.length);
       facts.push({
         title,
+        content,
         source,
         type,
         rawType,
@@ -305,6 +318,11 @@ function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
   }
 
   return facts;
+}
+
+function panSouEvidenceScore(content: string): number {
+  const formatEvidence = content.match(/(?:^|\b)(?:file|folder)\s*:|\.(?:epub|azw3?|mobi|pdf|txt|cbz|cbr)\b/gi)?.length ?? 0;
+  return formatEvidence * 10_000 + content.length;
 }
 
 function normalizeResourceType(rawType: string, url: string): ResourceType | null {
