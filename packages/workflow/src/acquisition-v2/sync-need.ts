@@ -18,6 +18,8 @@ export interface SeasonSyncInput {
   seasonNumber: number;
   /** Aired up to this episode (the should-exist range is E01..latestAiredEpisode). */
   latestAiredEpisode: number;
+  /** Metadata season ceiling; provider-ahead marks beyond it are invalid. */
+  totalEpisodes?: number;
 }
 
 export interface SeasonNeedResult {
@@ -47,11 +49,21 @@ export function syncSeasonNeed(input: {
   }
 
   // Provider-ahead = a DB mark beyond the aired cursor of an in-scope season.
-  const airedMax = new Map(input.seasons.map((season) => [season.seasonNumber, season.latestAiredEpisode]));
+  const bounds = new Map(
+    input.seasons.map((season) => [
+      season.seasonNumber,
+      { latestAiredEpisode: season.latestAiredEpisode, totalEpisodes: season.totalEpisodes },
+    ]),
+  );
   const providerAhead: string[] = [];
   for (const code of have) {
-    const max = airedMax.get(episodePartsFromCode(code).seasonNumber);
-    if (max !== undefined && episodeNumberFromCode(code) > max) {
+    const bound = bounds.get(episodePartsFromCode(code).seasonNumber);
+    const episode = episodeNumberFromCode(code);
+    if (
+      bound !== undefined &&
+      episode > bound.latestAiredEpisode &&
+      (bound.totalEpisodes === undefined || episode <= bound.totalEpisodes)
+    ) {
       providerAhead.push(code);
     }
   }

@@ -1,7 +1,7 @@
 import type { AgentMemoryStore } from "../agent-memory.js";
 import type { LanguageModel } from "ai";
 import type { ResourceProvider, StorageExecutor } from "../ports.js";
-import type { AuditEvent } from "../domain.js";
+import { episodePartsFromCode, type AuditEvent } from "../domain.js";
 import {
   bindRecoveryDirectories,
   ensureSeasonAcquisitionDirectories,
@@ -19,6 +19,7 @@ import { readLandedSize } from "./landed-size.js";
 import type { AgentToolEvent } from "./activity.js";
 import { runAcquisitionV2, type AcquisitionV2Outcome, type RunAcquisitionV2Request, type RunAcquisitionV2Result } from "./orchestrator.js";
 import type { JevJudge } from "../jev-judge.js";
+import { episodeUpperBoundHint } from "../episode-range.js";
 import { syncSeasonNeed } from "./sync-need.js";
 import type { SearchProfile } from "./search-profile.js";
 
@@ -34,6 +35,8 @@ export interface V2WorkflowSeason {
   seasonNumber: number;
   /** Aired up to this episode (should-exist = E01..latestAiredEpisode). */
   latestAiredEpisode: number;
+  /** Optional metadata ceiling used only to constrain provider-ahead probes. */
+  totalEpisodes?: number;
 }
 
 export interface RunAcquisitionV2WorkflowRequest {
@@ -50,6 +53,8 @@ export interface RunAcquisitionV2WorkflowRequest {
    *  Empty for a first acquisition; the type-3 patrol passes the DB's obtained
    *  episode codes so the need = aired − 实有 (NOT a 115 scan). */
   priorObtained?: string[];
+  /** Type-3 only: run a conservative availability probe even when aired need is empty. */
+  probeProviderAhead?: boolean;
   searchBudget?: number;
   maxSteps?: number;
   preferredLanguage?: string;
@@ -105,6 +110,63 @@ export interface RunAcquisitionV2WorkflowResult {
 }
 
 const EMPTY_OUTCOME: AcquisitionV2Outcome = { resourceSnapshots: [], decisions: [], transferAttempts: [] };
+
+async function hasProviderAheadHint(request: RunAcquisitionV2WorkflowRequest): Promise<boolean> {
+  try {
+    const snapshot = await request.provider.search({
+      keyword: request.title.name,
+      workflowRunId: request.workflowRunId,
+    });
+    return request.seasons.some((season) =>
+      snapshot.candidates.some((candidate) => {
+        const hinted = episodeUpperBoundHint(candidate.title, season.seasonNumber);
+        return (
+          hinted !== null &&
+          hinted > season.latestAiredEpisode &&
+          (season.totalEpisodes === undefined || hinted <= season.totalEpisodes)
+        );
+      }),
+    );
+  } catch {
+    // Availability probing is opportunistic. A provider outage must not turn an
+    // already-current season into a failed patrol; the next sweep tries again.
+    return false;
+  }
+}
+
+async function verifiedProviderAheadCodes(
+  request: RunAcquisitionV2WorkflowRequest,
+  directories: AcquisitionDirectories,
+): Promise<string[]> {
+  const verified = new Set<string>();
+  for (const season of request.seasons) {
+    const directoryId = directories.seasonDirectoryIds[season.seasonNumber];
+    if (!directoryId) continue;
+    let files: Awaited<ReturnType<StorageExecutor["listVideoFiles"]>>;
+    try {
+      files = await request.executor.listVideoFiles(directoryId);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.episodeCode) continue;
+      let parts: ReturnType<typeof episodePartsFromCode>;
+      try {
+        parts = episodePartsFromCode(file.episodeCode);
+      } catch {
+        continue;
+      }
+      if (
+        parts.seasonNumber === season.seasonNumber &&
+        parts.episodeNumber > season.latestAiredEpisode &&
+        (season.totalEpisodes === undefined || parts.episodeNumber <= season.totalEpisodes)
+      ) {
+        verified.add(file.episodeCode);
+      }
+    }
+  }
+  return [...verified];
+}
 
 export async function runAcquisitionV2Workflow(
   request: RunAcquisitionV2WorkflowRequest,
@@ -164,15 +226,20 @@ export async function runAcquisitionV2Workflow(
   const seasonsForSync = request.seasons.map((season) => ({
     seasonNumber: season.seasonNumber,
     latestAiredEpisode: season.latestAiredEpisode,
+    ...(season.totalEpisodes === undefined ? {} : { totalEpisodes: season.totalEpisodes }),
   }));
   const priorObtained = request.priorObtained ?? [];
 
   // 7b — sync the need from the DB marks (应有 − 实有). No 115 scan, no parser.
   const before = syncSeasonNeed({ seasons: seasonsForSync, obtained: priorObtained });
+  const providerAheadProbe =
+    before.missing.length === 0 &&
+    request.probeProviderAhead === true &&
+    (await hasProviderAheadHint(request));
   // A user request runs the agent even on a complete library: the episodes to
   // replace are obtained (the old file is there), so they are never "missing".
   // A leftover may be the only copy of an episode the DB already calls obtained.
-  if (before.missing.length === 0 && !request.userRequest && !request.stagingRecovery) {
+  if (before.missing.length === 0 && !request.userRequest && !request.stagingRecovery && !providerAheadProbe) {
     // Already current — no agent run, no side effects (the type-3 no-op path).
     return {
       directories,
@@ -201,6 +268,16 @@ export async function runAcquisitionV2Workflow(
       // Only the truly missing ones: episodes to replace join the need inside the
       // orchestrator and are described separately in the USER REQUESTS block.
       missingEpisodes: before.missing,
+      ...(providerAheadProbe
+        ? {
+            providerAheadProbe: true,
+            seasonBounds: request.seasons.map((season) => ({
+              seasonNumber: season.seasonNumber,
+              latestAiredEpisode: season.latestAiredEpisode,
+              ...(season.totalEpisodes === undefined ? {} : { totalEpisodes: season.totalEpisodes }),
+            })),
+          }
+        : {}),
       qualityPreference: request.qualityPreference,
       ...(request.title.tmdbId ? { tmdbId: request.title.tmdbId } : {}),
     },
@@ -237,9 +314,12 @@ export async function runAcquisitionV2Workflow(
   // whether or not the replacement landed. The agent's side carries such an episode
   // only once it was reported replaced (sandbox finish): one declared file-less and
   // reported not_found never becomes obtained on a bare mark.
+  const newlyVerified = providerAheadProbe
+    ? await verifiedProviderAheadCodes(request, directories)
+    : v2.coverage.obtained;
   const after = syncSeasonNeed({
     seasons: seasonsForSync,
-    obtained: [...priorObtained, ...v2.coverage.obtained],
+    obtained: [...priorObtained, ...newlyVerified],
   });
 
   // Best-effort real landed size for the notification (true per-episode bytes,

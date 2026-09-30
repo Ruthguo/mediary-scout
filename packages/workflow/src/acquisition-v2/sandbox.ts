@@ -11,6 +11,8 @@ import type { SimTreeFile, StorageV2, TransferAttemptResult } from "./storage-11
 import { isSystemicTransferBlockMessage } from "./transfer-block.js";
 import { animeSearchTabooWarnings, type SearchProfile } from "./search-profile.js";
 import type { AuditEvent } from "../domain.js";
+import { episodePartsFromCode } from "../domain.js";
+import { episodeCodeFromFileName } from "../episode-code.js";
 import { isMergedSourceEvidenceUsable, type MergedSourceHealth } from "../resource-source-health.js";
 import { JEV_UNCERTAIN_LEGEND, jevAllDroppedWarning, jevUncertaintyFlag } from "../jev-judge.js";
 import {
@@ -181,6 +183,9 @@ export interface TaskSandboxOptions {
    *  has a markObtained-confirmed entry. Drives the §3 "no more side effects once
    *  satisfied" gate. The need is just "what's still missing"; sync computes it. */
   need?: string[];
+  /** Permit a type-3 probe with no aired gaps, bounded to genuinely newer files. */
+  providerAheadProbe?: boolean;
+  providerAheadBounds?: Record<number, { latestAiredEpisode: number; totalEpisodes?: number }>;
   /** Title + aliases + original title. Context for the anime taboo-keyword
    *  warnings only (a year that is part of the title is not a taboo year). Search
    *  keywords are NOT checked against them: the agent may search any name,
@@ -335,6 +340,8 @@ export class TaskSandbox {
   /** A movie task's one target directory (movies have no seasons). */
   private readonly movieDir: string | undefined;
   private readonly need: string[];
+  private readonly providerAheadProbe: boolean;
+  private readonly providerAheadBounds: TaskSandboxOptions["providerAheadBounds"];
   private readonly titleTerms: readonly string[];
   private readonly subtitleFallback: boolean;
   /** Reserve-zone threshold (movie 8+2) — undefined disables the reserve zone. */
@@ -441,6 +448,8 @@ export class TaskSandbox {
     );
     this.movieDir = options.targetMovieDirectoryId;
     this.need = [...(options.need ?? [])];
+    this.providerAheadProbe = options.providerAheadProbe ?? false;
+    this.providerAheadBounds = options.providerAheadBounds;
     this.titleTerms = options.titleTerms ?? [];
     this.subtitleProvider = options.subtitleProvider;
     this.memory = options.memory;
@@ -1065,13 +1074,35 @@ export class TaskSandbox {
         `MOVE_NOT_DONE: these files did NOT move (${ids.join(", ")}). Do not markObtained their episodes this run — they are still only in staging. ${reason}`,
       );
     }
-    const stagingIds = new Set(stagingTree.map((file) => file.id));
+    const stagingById = new Map(stagingTree.map((file) => [file.id, file]));
+    const stagingIds = new Set(stagingById.keys());
     const outOfScope = resolved.flatMap((move) => move.fileIds).filter((fileId) => !stagingIds.has(fileId));
     if (outOfScope.length > 0) {
       throw new Error(`SANDBOX_FILES_NOT_IN_STAGING: ${outOfScope.join(",")}`);
     }
     // A movie's staging IS its movie dir, so the old film sits "in staging" too.
     this.assertNotProtected(resolved.flatMap((move) => move.fileIds));
+    if (this.providerAheadProbe && this.providerAheadBounds) {
+      for (const move of resolved) {
+        if (move.season === undefined) continue;
+        const bound = this.providerAheadBounds[move.season];
+        if (!bound) throw new Error(`SANDBOX_PROVIDER_AHEAD_NO_BOUND: season ${move.season}`);
+        for (const fileId of move.fileIds) {
+          const file = stagingById.get(fileId);
+          if (!file?.isVideo) continue;
+          const code = episodeCodeFromFileName(file.path);
+          if (!code) throw new Error(`SANDBOX_PROVIDER_AHEAD_UNPARSED_VIDEO: ${file.path}`);
+          const parts = episodePartsFromCode(code);
+          if (
+            parts.seasonNumber !== move.season ||
+            parts.episodeNumber <= bound.latestAiredEpisode ||
+            (bound.totalEpisodes !== undefined && parts.episodeNumber > bound.totalEpisodes)
+          ) {
+            throw new Error(`SANDBOX_PROVIDER_AHEAD_OUT_OF_BOUNDS: ${code}`);
+          }
+        }
+      }
+    }
     // Hold every validated id before the first move. A throw on season 1 must not
     // leave season 2's files unmarked — the loop never reaches them.
     for (const fileId of resolved.flatMap((move) => move.fileIds)) {
@@ -1343,7 +1374,7 @@ export class TaskSandbox {
         return a < b ? -1 : a > b ? 1 : 0;
       });
     return {
-      coverageMet: this.isCoverageMet(),
+      coverageMet: this.providerAheadProbe || this.isCoverageMet(),
       obtained,
       missing: this.missingNeed(),
       subtitleFallback: this.subtitleFallbackUsed,

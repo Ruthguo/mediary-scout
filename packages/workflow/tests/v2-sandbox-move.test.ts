@@ -16,6 +16,39 @@ async function setup() {
   return { sandbox };
 }
 
+async function providerAheadSetup() {
+  const provider = new FakeResourceProviderV2({
+    results: { show: [{ id: "cand_ahead", title: "Show 更至17集" }] },
+  });
+  const storage = new Storage115Simulator({
+    packs: {
+      cand_ahead: {
+        files: ["S01E04", "S01E05", "S01E17"].map((code) => ({
+          path: `Pack/Show.${code}.mkv`,
+          sizeBytes: 1,
+        })),
+      },
+    },
+  });
+  const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+  const targetSeasonDirectoryId = await storage.createDirectory({ name: "Season 1", parentId: "root" });
+  const sandbox = new TaskSandbox({
+    provider,
+    storage,
+    stagingDirectoryId,
+    targetSeasonDirectoryIds: { 1: targetSeasonDirectoryId },
+    need: [],
+    providerAheadProbe: true,
+    providerAheadBounds: { 1: { latestAiredEpisode: 4, totalEpisodes: 16 } },
+  });
+  const search = await sandbox.searchResources("show");
+  const transfer = await sandbox.transferCandidate({
+    snapshotId: search.snapshot!.id,
+    candidateId: "cand_ahead",
+  });
+  return { sandbox, transfer };
+}
+
 describe("TaskSandbox — moveToSeason (agent-driven extract, scoped, reread)", () => {
   it("moves agent-selected staging files into the scoped season dir and rereads both", async () => {
     const { sandbox } = await setup();
@@ -34,5 +67,22 @@ describe("TaskSandbox — moveToSeason (agent-driven extract, scoped, reread)", 
   it("refuses moving a file that is not in this task's staging (scope guard)", async () => {
     const { sandbox } = await setup();
     await expect(sandbox.moveToSeason({ moves: [{ season: 1, fileIds: ["not_in_staging"] }] })).rejects.toThrow(/staging/i);
+  });
+
+  it("provider-ahead probe physically moves only parsed episodes within cursor and total bounds", async () => {
+    const { sandbox, transfer } = await providerAheadSetup();
+    const idFor = (code: string) => transfer.staging.find((file) => file.path.includes(code))!.id;
+
+    await expect(
+      sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [idFor("S01E04")] }] }),
+    ).rejects.toThrow(/OUT_OF_BOUNDS/);
+    await expect(
+      sandbox.moveToSeason({ moves: [{ season: 1, fileIds: [idFor("S01E17")] }] }),
+    ).rejects.toThrow(/OUT_OF_BOUNDS/);
+
+    const moved = await sandbox.moveToSeason({
+      moves: [{ season: 1, fileIds: [idFor("S01E05")] }],
+    });
+    expect(moved.seasons[1]!.some((file) => file.path.includes("S01E05"))).toBe(true);
   });
 });

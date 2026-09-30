@@ -37,6 +37,15 @@ describe("syncSeasonNeed — 应有 vs 实有(DB marks) = 缺什么 (no 115 scan
     expect(result.providerAhead).toEqual(["S01E03"]);
   });
 
+  it("does not accept provider-ahead marks beyond the metadata season total", () => {
+    const result = syncSeasonNeed({
+      seasons: [{ seasonNumber: 1, latestAiredEpisode: 4, totalEpisodes: 16 }],
+      obtained: ["S01E04", "S01E06", "S01E17"],
+    });
+
+    expect(result.providerAhead).toEqual(["S01E06"]);
+  });
+
   it("实有 is PURELY the DB marks — empty marks ⇒ every aired episode is missing (no disk fallback)", () => {
     const result = syncSeasonNeed({
       seasons: [{ seasonNumber: 1, latestAiredEpisode: 3 }],

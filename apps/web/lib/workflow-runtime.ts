@@ -2583,6 +2583,16 @@ async function getWorkerStorageExecutor(
         env: process.env,
       });
     }
+    // A run/tracked row pinned to a drive that has since been unbound must not
+    // fall through to the legacy global 115 executor. Besides targeting the
+    // wrong provider, that fallback produces misleading PAN115_COOKIE / write
+    // scope errors and can abort a cross-drive patrol. The caller isolates this
+    // unavailable drive and continues patrolling the remaining connected ones.
+    if (connectedStorageId) {
+      throw new Error(
+        `CONNECTED_STORAGE_UNAVAILABLE: ${connectedStorageId} is unbound or has no usable credential`,
+      );
+    }
     // No drive bound yet → legacy env-cookie 115 path (fresh deploy bootstrap).
     return createProtectedPan115CookieStorageExecutorFromEnv({ env: process.env });
   }

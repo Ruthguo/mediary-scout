@@ -437,6 +437,11 @@ export type ScheduledType3Outcome =
     }
   | {
       trackedSeasonId: string;
+      status: "skipped_unavailable_storage";
+      errorMessage: string;
+    }
+  | {
+      trackedSeasonId: string;
       status: "ran";
       workflowRunId: string;
       workflowStatus: WorkflowStatus;
@@ -573,12 +578,21 @@ async function patrolTrackedState(args: {
 }): Promise<ScheduledType3Outcome | null> {
   const { input, state, now } = args;
   {
-    const deps = await resolveWorkerDeps(
-      input.resolveAccountContext,
-      state.accountId,
-      state.connectedStorageId,
-      input,
-    );
+    let deps: Awaited<ReturnType<typeof resolveWorkerDeps>>;
+    try {
+      deps = await resolveWorkerDeps(
+        input.resolveAccountContext,
+        state.accountId,
+        state.connectedStorageId,
+        input,
+      );
+    } catch (error) {
+      return {
+        trackedSeasonId: state.season.id,
+        status: "skipped_unavailable_storage",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      };
+    }
     // Patrol dispatches by title.type: a film needs the MOVIE agent, not the
     // TV/anime agent (different semantics). (未上映/reserved films aren't tracked
     // yet; the air-time gate lands with that product state.)
