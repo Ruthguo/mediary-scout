@@ -63,6 +63,7 @@ export interface ActivityCompletedItem {
 
 export interface ActivityBookItem {
   runId: string;
+  bookId: string;
   title: string;
   authors: string;
   coverUrl: string | null;
@@ -106,6 +107,7 @@ export async function getActivityView(input: {
       .filter((entry) => entry.status !== "saved")
       .map((entry) => ({
         runId: `book_${entry.book.id}`,
+        bookId: entry.book.id,
         title: entry.book.title,
         authors: entry.book.authors.join("、") || "作者未知",
         coverUrl: entry.book.coverUrl,
