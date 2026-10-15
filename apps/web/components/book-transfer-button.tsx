@@ -4,8 +4,7 @@ import { useEffect, useState, useTransition } from "react";
 import { createPortal } from "react-dom";
 import { Check, LoaderCircle, Plus } from "lucide-react";
 import { requestBookAction } from "../app/actions";
-import { untrackBookAction } from "../app/actions";
-import { useRouter } from "../lib/use-router";
+import { UntrackButton } from "./untrack-button";
 
 export function BookTransferButton({
   query,
@@ -20,9 +19,7 @@ export function BookTransferButton({
   initialStatus?: "queued" | "running" | "pending" | "saved" | "failed" | undefined;
   messageContainerId?: string | undefined;
 }) {
-  const router = useRouter();
   const [pending, startTransition] = useTransition();
-  const [untrackError, setUntrackError] = useState<string | null>(null);
   const [messageContainer, setMessageContainer] = useState<HTMLElement | null>(null);
   useEffect(() => {
     if (messageContainerId) setMessageContainer(document.getElementById(messageContainerId));
@@ -34,8 +31,11 @@ export function BookTransferButton({
         ? { status: "pending", message: "转存处理中。" }
         : null,
   );
+  const untrack = initialStatus || result?.status === "saved" || result?.status === "pending" ? (
+    <UntrackButton mediaKind="book" bookId={bookId} storageId={storageId} basePath={storageId ? `/w/${encodeURIComponent(storageId)}` : "/"} disabled={pending || result?.status === "pending"} />
+  ) : null;
   if (result?.status === "saved") {
-    return <div className="request-track book-actions"><span className="hub-badge tone-green"><Check size={12} aria-hidden />已获取</span><button className="secondary-button" type="button" disabled={pending} onClick={() => startTransition(async () => { try { const response = await untrackBookAction({ bookId, storageId }); if (response.status === "untracked") { router.push(`${storageId ? `/w/${encodeURIComponent(storageId)}` : "/"}?tab=library&type=book`); } else { setUntrackError(response.message); } } catch (error) { setUntrackError(error instanceof Error ? error.message : "取消追踪失败，请刷新后重试。"); } })}>取消追踪</button>{untrackError ? <span role="alert">{untrackError}</span> : null}</div>;
+    return <div className="request-track book-actions"><span className="hub-badge tone-green"><Check size={12} aria-hidden />已获取</span>{untrack}</div>;
   }
   return (
     <div className="request-track book-actions">
@@ -54,6 +54,7 @@ export function BookTransferButton({
         {pending ? <LoaderCircle size={16} className="spin" aria-hidden /> : <Plus size={16} aria-hidden />}
         {pending ? "获取中" : result?.status === "saved" ? "已获取" : result?.status === "pending" ? "已提交" : initialStatus === "failed" || result?.status === "failed" ? "重新获取" : "获取"}
       </button>
+      {untrack}
       {result ? (() => {
         const message = <span className={`book-action-message${result.status === "failed" ? " is-error" : ""}`} role={result.status === "failed" ? "alert" : "status"}>{result.message}</span>;
         return messageContainerId ? messageContainer ? createPortal(message, messageContainer) : null : message;

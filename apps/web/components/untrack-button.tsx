@@ -3,7 +3,7 @@
 import { LoaderCircle, Trash2 } from "lucide-react";
 import { useState, useTransition } from "react";
 import { useRouter } from "../lib/use-router";
-import { untrackTitleAction } from "../app/actions";
+import { untrackBookAction, untrackTitleAction } from "../app/actions";
 import { runAction } from "../lib/run-action";
 import { isDemoModeClient } from "../lib/demo-mode";
 
@@ -16,23 +16,25 @@ import { isDemoModeClient } from "../lib/demo-mode";
  */
 export function UntrackButton({
   tmdbId,
+  bookId,
   storageId,
   mediaKind,
   seasonNumber,
   basePath,
   label = "取消追踪",
+  disabled = false,
 }: {
-  tmdbId: number;
   /** Tree model: the active workspace drive. REQUIRED (value may be undefined = primary). */
   storageId: string | undefined;
-  /** Disambiguate TMDB movie/tv id namespaces (same number can be both). */
-  mediaKind: "movie" | "tv";
-  /** Given → untrack only this season; omitted → the whole show on this drive. */
-  seasonNumber?: number | undefined;
   /** Library path to return to after a whole-show untrack ("/" or "/w/<id>"). */
   basePath: string;
   label?: string;
-}) {
+  disabled?: boolean;
+} & (
+  // Books have catalog IDs; film and TV use separate TMDB namespaces.
+  | { mediaKind: "book"; bookId: string; tmdbId?: never; seasonNumber?: never }
+  | { mediaKind: "movie" | "tv"; tmdbId: number; bookId?: never; seasonNumber?: number | undefined }
+)) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
   const [confirming, setConfirming] = useState(false);
@@ -49,7 +51,7 @@ export function UntrackButton({
       // 否则按钮卡在确认态。
       const r = await runAction(
         () =>
-          untrackTitleAction({
+          mediaKind === "book" ? untrackBookAction({ bookId, storageId }) : untrackTitleAction({
             tmdbId,
             storageId,
             mediaKind,
@@ -64,7 +66,7 @@ export function UntrackButton({
       if (!r.ok) return;
       const result = r.value;
       if (result.status === "untracked" && seasonNumber === undefined) {
-        // Whole-show untracked → it's gone from the library; go there to show it.
+        // Whole title untracked → it's gone from the library; return there.
         router.push(`${basePath}?tab=library`);
         return;
       }
@@ -79,7 +81,7 @@ export function UntrackButton({
       {confirming ? (
         <>
           <span className="untrack-note">取消后从媒体库移除，网盘文件保留（重新获取可秒传恢复）。</span>
-          <button type="button" className="ghost-button danger" disabled={isPending} onClick={run}>
+          <button type="button" className="ghost-button danger" disabled={disabled || isPending} onClick={run}>
             {isPending ? <LoaderCircle size={13} className="spin" aria-hidden /> : null}
             确认取消追踪
           </button>
@@ -96,7 +98,7 @@ export function UntrackButton({
         <button
           type="button"
           className="ghost-button danger"
-          disabled={isPending}
+          disabled={disabled || isPending}
           onClick={() => {
             setMessage(null);
             setConfirming(true);
