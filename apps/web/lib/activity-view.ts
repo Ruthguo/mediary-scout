@@ -59,15 +59,18 @@ export interface ActivityCompletedItem {
   /** "每集 约 410 MB" / "体积 1.4 GB"; null when unknown. */
   sizeText: string | null;
   createdAt: string;
+  /** Books use the same completion row, with their own catalog detail route. */
+  detailsHref?: string;
+  imageUrl?: string | null;
+  message?: string | undefined;
 }
 
 export interface ActivityBookItem {
   runId: string;
-  bookId: string;
   title: string;
   authors: string;
   coverUrl: string | null;
-  status: "pending" | "saved" | "failed";
+  status: "pending";
   activity: string;
 }
 
@@ -103,16 +106,16 @@ export async function getActivityView(input: {
     isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
   const bookScope = scope ?? { accountId: "acct_default", connectedStorageId: null };
-  const books = (await input.repository.listBookEntries(bookScope))
-      .filter((entry) => entry.status !== "saved")
+  const bookEntries = await input.repository.listBookEntries(bookScope);
+  const books = bookEntries
+      .filter((entry) => entry.status === "queued" || entry.status === "running" || entry.status === "pending")
       .map((entry) => ({
         runId: `book_${entry.book.id}`,
-        bookId: entry.book.id,
         title: entry.book.title,
         authors: entry.book.authors.join("、") || "作者未知",
         coverUrl: entry.book.coverUrl,
-        status: entry.status === "failed" ? "failed" as const : "pending" as const,
-        activity: entry.status === "queued" ? "正在排队获取…" : entry.status === "running" ? "正在查找电子书资源…" : entry.status === "failed" ? entry.message ?? "获取失败，请重试。" : "正在等待网盘完成转存…",
+        status: "pending" as const,
+        activity: entry.status === "queued" ? "正在排队获取…" : entry.status === "running" ? "正在查找电子书资源…" : "正在等待网盘完成转存…",
       }));
 
   // Poster backfill source: older notifications predate report.posterPath, so a
@@ -192,6 +195,24 @@ export async function getActivityView(input: {
       };
     });
 
+  // A book's durable entry is its run result; adapt it to the existing media
+  // completion model rather than keeping terminal entries in the active list.
+  for (const entry of bookEntries) {
+    if (entry.status !== "failed" && entry.status !== "saved") continue;
+    recentCompleted.push({
+      workflowRunId: `book_${entry.book.id}`,
+      title: entry.book.title,
+      seasonLabel: null,
+      status: entry.status === "saved" ? "complete" : "failed",
+      posterPath: null,
+      imageUrl: entry.book.coverUrl,
+      sizeText: null,
+      createdAt: entry.updatedAt,
+      message: entry.status === "failed" ? entry.message : undefined,
+      detailsHref: `/book/${encodeURIComponent(entry.book.id)}?w=${encodeURIComponent(entry.connectedStorageId)}`,
+    });
+  }
+  recentCompleted.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   return { active, books, recentCompleted };
 }
 

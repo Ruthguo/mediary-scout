@@ -52,7 +52,7 @@ export function BookTransferButton({
         })}
       >
         {pending ? <LoaderCircle size={16} className="spin" aria-hidden /> : <Plus size={16} aria-hidden />}
-        {pending ? "获取中" : result?.status === "saved" ? "已获取" : result?.status === "pending" ? "已提交" : "获取"}
+        {pending ? "获取中" : result?.status === "saved" ? "已获取" : result?.status === "pending" ? "已提交" : initialStatus === "failed" || result?.status === "failed" ? "重新获取" : "获取"}
       </button>
       {result ? (() => {
         const message = <span className={`book-action-message${result.status === "failed" ? " is-error" : ""}`} role={result.status === "failed" ? "alert" : "status"}>{result.message}</span>;

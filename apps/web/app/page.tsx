@@ -501,7 +501,7 @@ function CandidateCard({
 
 async function LibrarySurface({ mediaType, filter, storageId }: { mediaType: string; filter: string; storageId?: string | undefined }) {
   const [rawWall, inProgress, bookScope] = await Promise.all([getLibraryWall(storageId), getInProgressTitles(storageId), getActiveWorkspaceScope(storageId)]);
-  const books = (await getWorkflowRepository().listBookEntries(bookScope)).filter((entry) => entry.status !== "failed");
+  const books = await getWorkflowRepository().listBookEntries(bookScope);
   const inProgressIds = new Set(inProgress.map((title) => title.tmdbId));
   // A title still being fetched shows as a 获取中 placeholder, not (yet) a card.
   const wall = rawWall.filter((entry) => !inProgressIds.has(entry.tmdbId));
@@ -638,6 +638,8 @@ function BookCategoryRow({ books, storageId }: { books: BookLibraryEntry[]; stor
 
 function BookPosterCard({ entry, storageId }: { entry: BookLibraryEntry; storageId?: string | undefined }) {
   const href = `/book/${entry.book.id}${storageId ? `?w=${encodeURIComponent(storageId)}` : ""}`;
+  const label = entry.status === "saved" ? "已入库" : entry.status === "failed" ? "获取失败" : "获取中";
+  const StatusIcon = entry.status === "saved" ? CheckCircle2 : entry.status === "failed" ? TriangleAlert : Clock3;
   return (
     <Link className="wall-card" href={href}>
       <span className="wall-poster">
@@ -645,9 +647,9 @@ function BookPosterCard({ entry, storageId }: { entry: BookLibraryEntry; storage
           // eslint-disable-next-line @next/next/no-img-element
           <img src={entry.book.coverUrl} alt="" loading="lazy" />
         ) : <span className="poster-fallback">{entry.book.title.slice(0, 4)}</span>}
-        <span className="wall-states"><span className={`wall-state tone-${entry.status === "saved" ? "green" : "amber"}`} title={entry.status === "saved" ? "已入库" : "转存处理中"}>{entry.status === "saved" ? <CheckCircle2 size={13} aria-hidden /> : <Clock3 size={13} aria-hidden />}</span></span>
+        <span className="wall-states"><span className={`wall-state tone-${entry.status === "saved" ? "green" : "amber"}`} title={label}><StatusIcon size={13} aria-hidden /></span></span>
       </span>
-      <span className="wall-copy"><strong>{entry.book.title}</strong><span>{entry.book.authors.join("、") || "作者未知"} · {entry.status === "saved" ? "已入库" : "转存处理中"}</span></span>
+      <span className="wall-copy"><strong>{entry.book.title}</strong><span>{entry.book.authors.join("、") || "作者未知"} · {label}</span></span>
     </Link>
   );
 }

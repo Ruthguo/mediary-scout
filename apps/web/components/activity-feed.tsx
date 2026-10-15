@@ -38,7 +38,7 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
         const res = await fetch(url, { cache: "no-store" });
         if (!res.ok) return;
         const data = (await res.json()) as ActivityView;
-        for (const run of data.active) {
+        for (const run of [...data.active, ...data.books]) {
           seenActive.current.add(run.runId);
         }
         if (alive) setView(data);
@@ -68,8 +68,7 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
   const demoDone = isDemo ? demoCompletedItems(demoAcq) : [];
   const demoActive = demoInProgressActivityItems(useDemoInProgress());
   const allCompleted = [...demoDone, ...completed];
-  const activeBooks = view.books.filter((book) => book.status === "pending");
-  const failedBooks = view.books.filter((book) => book.status === "failed");
+  const activeBooks = view.books;
 
   return (
     <div className="activity">
@@ -92,14 +91,8 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
       {activeBooks.length > 0 ? (
         <section className="act-section">
           <div className="act-section-head act-section-head-static">书籍获取</div>
-          {activeBooks.map((book) => <BookActivityRow book={book} storageId={storageId} key={book.runId} />)}
+          {activeBooks.map((book) => <BookActivityRow book={book} key={book.runId} />)}
         </section>
-      ) : null}
-
-      {failedBooks.length > 0 ? (
-        <CollapsibleSection title="书籍获取失败" count={failedBooks.length} defaultOpen>
-          {failedBooks.map((book) => <BookActivityRow book={book} storageId={storageId} key={book.runId} />)}
-        </CollapsibleSection>
       ) : null}
 
       <CollapsibleSection title="排队中" count={queued.length} defaultOpen>
@@ -121,19 +114,14 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
   );
 }
 
-export function BookActivityRow({ book, storageId }: { book: ActivityBookItem; storageId?: string | undefined }) {
-  const pending = book.status === "pending";
+export function BookActivityRow({ book }: { book: ActivityBookItem }) {
   return (
-    <div className={`act-row ${pending ? "act-row-active" : "act-row-done"}`}>
+    <div className="act-row act-row-active">
       {book.coverUrl ? <img className="act-poster" src={book.coverUrl} alt="" /> : <span className="act-poster act-poster-fallback tone-info">书</span>}
       <div className="act-row-body">
         <div className="act-row-head"><strong>{book.title}</strong><span className="act-sub">{book.authors}</span></div>
-        {pending ? <div className="act-bar"><div className="act-bar-fill" style={{ width: "55%" }} /></div> : null}
-        <div className="act-ticker-row">
-          {pending ? <Loader2 size={14} className="act-spin" aria-hidden /> : book.status === "saved" ? <CheckCircle2 size={14} aria-hidden /> : <TriangleAlert size={14} aria-hidden />}
-          {pending ? <Ticker text={book.activity} /> : <span>{book.activity}</span>}
-        </div>
-        {book.status === "failed" ? <Link className="act-sub" href={`/book/${encodeURIComponent(book.bookId)}${storageId ? `?w=${encodeURIComponent(storageId)}` : ""}`}>查看书籍并重试</Link> : null}
+        <div className="act-bar"><div className="act-bar-fill" style={{ width: "55%" }} /></div>
+        <div className="act-ticker-row"><Loader2 size={14} className="act-spin" aria-hidden /><Ticker text={book.activity} /></div>
       </div>
     </div>
   );
@@ -276,13 +264,13 @@ function completedPillLabel(status: ActivityCompletedItem["status"]): string {
   }
 }
 
-function CompletedRow({ item }: { item: ActivityCompletedItem }) {
+export function CompletedRow({ item }: { item: ActivityCompletedItem }) {
   const ok =
     item.status === "complete" || item.status === "acquired" || item.status === "airing" || item.status === "replaced";
   const failed = item.status === "failed";
   return (
     <div className="act-row act-row-done">
-      {poster(item.posterPath, item.title, ok ? "success" : "warn")}
+      {item.imageUrl ? <img className="act-poster" src={item.imageUrl} alt="" /> : poster(item.posterPath, item.title, ok ? "success" : "warn")}
       <div className="act-row-body act-row-inline">
         <strong>{item.title}</strong>
         {item.seasonLabel ? <span className="act-sub">{item.seasonLabel}</span> : null}
@@ -291,7 +279,8 @@ function CompletedRow({ item }: { item: ActivityCompletedItem }) {
           {completedPillLabel(item.status)}
         </span>
         {item.sizeText ? <span className="act-sub">{item.sizeText}</span> : null}
-        {failed ? <RetryButton runId={item.workflowRunId} title={item.title} /> : null}
+        {item.message ? <span className="act-sub">{item.message}</span> : null}
+        {failed ? item.detailsHref ? <Link className="act-retry" href={item.detailsHref}><RotateCcw size={13} aria-hidden /> 重新获取</Link> : <RetryButton runId={item.workflowRunId} title={item.title} /> : null}
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   InMemoryWorkflowRepository,
+  type BookLibraryEntry,
   type EpisodeState,
   type MediaTitle,
   type PersistWorkflowRunSnapshotInput,
@@ -223,4 +224,31 @@ describe("getActivityView", () => {
     const viewB = await getActivityView({ repository: repo, accountId: "acct_default", connectedStorageId: "cs_b" });
     expect(viewB.active.map((r) => r.title)).toEqual(["Beta"]);
   });
+  it("keeps failed books in the library, moves them to media completions, and allows requeueing", async () => {
+    const repo = new InMemoryWorkflowRepository();
+    const entry: BookLibraryEntry = {
+      book: { id: "douban_123", title: "翠鸟谋杀案", authors: ["作者"], year: null, coverUrl: null, description: "", sourceUrl: "" },
+      accountId: "acct_default", connectedStorageId: "drive 1", status: "failed",
+      message: "Agent 未找到可信的电子书资源。", directoryId: "", directoryPath: "", fileCount: 0,
+      updatedAt: "2026-10-15T00:00:00Z",
+    };
+    await repo.saveBookEntry(entry);
+    const scope = { accountId: entry.accountId, connectedStorageId: entry.connectedStorageId };
+    const failedView = await getActivityView({ repository: repo, ...scope });
+    expect(failedView.books).toEqual([]);
+    expect(failedView.recentCompleted).toContainEqual(expect.objectContaining({
+      workflowRunId: "book_douban_123", status: "failed", message: entry.message,
+      detailsHref: "/book/douban_123?w=drive%201",
+    }));
+    expect(await repo.listBookEntries(scope)).toEqual([entry]);
+    const otherDrive = await getActivityView({ repository: repo, accountId: entry.accountId, connectedStorageId: "other" });
+    expect(otherDrive.recentCompleted).toEqual([]);
+
+    await repo.queueBookEntry({ ...entry, status: "queued", message: undefined });
+    const retryView = await getActivityView({ repository: repo, ...scope });
+    expect(retryView.books).toContainEqual(expect.objectContaining({ runId: "book_douban_123", status: "pending" }));
+    expect(retryView.recentCompleted).toEqual([]);
+    expect((await repo.claimNextQueuedBookEntry())?.status).toBe("running");
+  });
+
 });

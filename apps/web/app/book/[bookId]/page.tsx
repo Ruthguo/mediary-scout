@@ -59,11 +59,11 @@ async function BookContent({
             ) : <BookOpen size={48} aria-hidden />}
           </div>
           <div>
-            <p className="panel-note">书籍{saved ? ` · ${saved.status === "saved" ? "已入库" : "转存处理中"}` : ""}</p>
+            <p className="panel-note">书籍{saved ? ` · ${saved.status === "saved" ? "已入库" : saved.status === "failed" ? "获取失败" : "获取中"}` : ""}</p>
             <h1>{book.title}</h1>
             <p>{book.authors.join("、") || "作者未知"}{book.year ? ` · ${book.year}` : ""}</p>
             {book.description ? <p className="book-description">{book.description}</p> : null}
-            {saved ? <p className="panel-note">{saved.directoryPath} · {saved.fileCount} 个文件</p> : null}
+            {saved?.status === "failed" ? <p className="panel-note" role="alert">{saved.message || "获取失败，请重新获取。"}</p> : saved ? <p className="panel-note">{saved.directoryPath} · {saved.fileCount} 个文件</p> : null}
             <div className="book-detail-actions">
               <BookTransferButton query={book.title} bookId={book.id} storageId={storageId} initialStatus={saved?.status} />
               {book.sourceUrl ? <a className="secondary-button book-source-link" href={book.sourceUrl} target="_blank" rel="noopener noreferrer">查看书籍资料</a> : null}
