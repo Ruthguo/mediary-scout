@@ -1,10 +1,15 @@
 import {
   DEFAULT_ACCOUNT_ID,
+  buildCrossDriveEpisodeOwnership,
+  compareEpisodeCodes,
   isStagingJanitorId,
   isUserVisibleNotificationKind,
   isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
+  type CrossDriveEpisodeOwnership,
+  type DriveSpaceCacheEntry,
+  type EpisodeCopy,
   type EpisodeState,
   type MediaTitle,
   type NotificationEvent,
@@ -449,6 +454,19 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
   setAccountPassword(accountId: string, passwordHash: string): Promise<void>;
   /** Revoke an account's sessions (after reset/change); optionally keep one. */
   deleteSessionsForAccount(accountId: string, exceptSessionId?: string): Promise<void>;
+  /** Cache a drive's probed space numbers (`drive_space_cache`). */
+  upsertDriveSpaceCache?(entry: DriveSpaceCacheEntry): Promise<void>;
+  /** Read cached space for one drive, or null if never probed. */
+  getDriveSpaceCache?(storageId: string): Promise<DriveSpaceCacheEntry | null>;
+  /** Record or update physical episode copies landed on a drive (`episode_copies`, C8). */
+  upsertEpisodeCopies?(copies: readonly EpisodeCopy[]): Promise<void>;
+  /** List recorded episode copies for a tracked season (`episode_copies`, C8). */
+  listEpisodeCopies?(trackedSeasonId: string): Promise<EpisodeCopy[]>;
+  /** Cross-drive union of obtained episodes + drive ownership for a season (C9). */
+  obtainedEpisodesForSeason?(
+    trackedSeasonId: string,
+    accountId?: string,
+  ): Promise<CrossDriveEpisodeOwnership[]>;
   // recordDeadLink + listDeadLinkKeys come from DeadLinkStore.
 }
 
@@ -475,6 +493,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   private readonly pendingReplacements = new Map<string, PendingReplacement>();
   private readonly rejectedResources: RejectedResource[] = [];
   private readonly episodeSources = new Map<string, EpisodeSource>();
+  private readonly driveSpaceCache = new Map<string, DriveSpaceCacheEntry>();
+  private readonly episodeCopies = new Map<string, EpisodeCopy>();
 
   async getSetting(key: string): Promise<string | null> {
     return this.settings.get(key) ?? null;
@@ -712,6 +732,73 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         this.sessions.delete(id);
       }
     }
+  }
+
+  async upsertDriveSpaceCache(entry: DriveSpaceCacheEntry): Promise<void> {
+    if (!Number.isFinite(entry.totalBytes) || !Number.isFinite(entry.usedBytes)) return;
+    this.driveSpaceCache.set(entry.storageId, { ...entry });
+  }
+
+  async getDriveSpaceCache(storageId: string): Promise<DriveSpaceCacheEntry | null> {
+    const entry = this.driveSpaceCache.get(storageId);
+    return entry ? { ...entry } : null;
+  }
+
+  async upsertEpisodeCopies(copies: readonly EpisodeCopy[]): Promise<void> {
+    for (const copy of copies) {
+      const key = `${copy.trackedSeasonId}::${copy.episodeCode}::${copy.storageId}`;
+      this.episodeCopies.set(key, {
+        ...copy,
+        fileIds: [...copy.fileIds],
+        sizeBytes:
+          copy.sizeBytes !== null && Number.isFinite(copy.sizeBytes)
+            ? Math.trunc(copy.sizeBytes)
+            : null,
+      });
+    }
+  }
+
+  async listEpisodeCopies(trackedSeasonId: string): Promise<EpisodeCopy[]> {
+    return [...this.episodeCopies.values()]
+      .filter((c) => c.trackedSeasonId === trackedSeasonId)
+      .sort(
+        (a, b) =>
+          compareEpisodeCodes(a.episodeCode, b.episodeCode) ||
+          a.storageId.localeCompare(b.storageId),
+      )
+      .map((c) => ({ ...c, fileIds: [...c.fileIds] }));
+  }
+
+  async obtainedEpisodesForSeason(
+    trackedSeasonId: string,
+    accountId: string = DEFAULT_ACCOUNT_ID,
+  ): Promise<CrossDriveEpisodeOwnership[]> {
+    const copies = await this.listEpisodeCopies(trackedSeasonId);
+    const storages = new Set<string>();
+    for (const snapshot of this.workflowRuns.values()) {
+      if (
+        snapshot.season.id === trackedSeasonId &&
+        (snapshot.accountId ?? DEFAULT_ACCOUNT_ID) === accountId
+      ) {
+        storages.add(snapshot.connectedStorageId ?? UNSCOPED_STORAGE);
+      }
+    }
+    const ownedStorages = new Set(
+      (await this.listConnectedStorages(accountId)).map((s) => s.id),
+    );
+    for (const sid of storages) {
+      if (sid !== UNSCOPED_STORAGE) ownedStorages.add(sid);
+    }
+    const driveEpisodeBuckets = [...storages].map((storageId) => ({
+      storageId,
+      episodes: this.episodesBySeason.get(seasonScopeKey(trackedSeasonId, storageId)) ?? [],
+    }));
+    return buildCrossDriveEpisodeOwnership({
+      driveEpisodeBuckets,
+      copies,
+      ownedStorageIds: ownedStorages,
+      unscopedStorageSentinel: UNSCOPED_STORAGE,
+    });
   }
 
   async recordDeadLink(input: {

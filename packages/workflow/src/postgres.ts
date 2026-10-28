@@ -2,12 +2,16 @@ import pg from "pg";
 import type { Pool, PoolClient } from "pg";
 import {
   DEFAULT_ACCOUNT_ID,
+  buildCrossDriveEpisodeOwnership,
   episodeNumberFromCode,
   HIDDEN_NOTIFICATION_KINDS,
   isStagingJanitorId,
   isUserVisibleWorkflowKind,
   type AgentDecision,
   type AgentStep,
+  type CrossDriveEpisodeOwnership,
+  type DriveSpaceCacheEntry,
+  type EpisodeCopy,
   type EpisodeState,
   type MediaTitle,
   type NotificationEvent,
@@ -260,6 +264,23 @@ const SCHEMA = `
     key text NOT NULL,
     value text NOT NULL,
     PRIMARY KEY (account_id, key)
+  );
+  CREATE TABLE IF NOT EXISTS drive_space_cache (
+    storage_id text PRIMARY KEY,
+    total_bytes bigint NOT NULL,
+    used_bytes bigint NOT NULL,
+    probed_at text NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS episode_copies (
+    tracked_season_id text NOT NULL,
+    episode_code text NOT NULL,
+    storage_id text NOT NULL,
+    file_ids jsonb NOT NULL,
+    size_bytes bigint,
+    quality text,
+    run_id text NOT NULL,
+    recorded_at text NOT NULL,
+    PRIMARY KEY (tracked_season_id, episode_code, storage_id)
   );
   ALTER TABLE tracked_seasons ADD COLUMN IF NOT EXISTS account_id text NOT NULL DEFAULT 'acct_default';
   ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS account_id text NOT NULL DEFAULT 'acct_default';
@@ -1512,6 +1533,128 @@ export class PostgresWorkflowRepository implements WorkflowRepository {
       accountId,
       exceptSessionId ?? null,
     ]);
+  }
+
+  async upsertDriveSpaceCache(entry: DriveSpaceCacheEntry): Promise<void> {
+    if (!Number.isFinite(entry.totalBytes) || !Number.isFinite(entry.usedBytes)) return;
+    await this.ensureSchema();
+    await this.pool.query(
+      "INSERT INTO drive_space_cache (storage_id, total_bytes, used_bytes, probed_at) VALUES ($1, $2, $3, $4) " +
+        "ON CONFLICT (storage_id) DO UPDATE SET total_bytes = EXCLUDED.total_bytes, used_bytes = EXCLUDED.used_bytes, probed_at = EXCLUDED.probed_at",
+      [entry.storageId, Math.trunc(entry.totalBytes), Math.trunc(entry.usedBytes), entry.probedAt],
+    );
+  }
+
+  async getDriveSpaceCache(storageId: string): Promise<DriveSpaceCacheEntry | null> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      storage_id: string;
+      total_bytes: string | number;
+      used_bytes: string | number;
+      probed_at: string;
+    }>("SELECT storage_id, total_bytes, used_bytes, probed_at FROM drive_space_cache WHERE storage_id = $1", [
+      storageId,
+    ]);
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      storageId: String(row.storage_id),
+      totalBytes: Number(row.total_bytes),
+      usedBytes: Number(row.used_bytes),
+      probedAt: String(row.probed_at),
+    };
+  }
+
+  async upsertEpisodeCopies(copies: readonly EpisodeCopy[]): Promise<void> {
+    if (copies.length === 0) return;
+    await this.ensureSchema();
+    await this.withTransaction(async (client) => {
+      for (const copy of copies) {
+        await client.query(
+          "INSERT INTO episode_copies (tracked_season_id, episode_code, storage_id, file_ids, size_bytes, quality, run_id, recorded_at) " +
+            "VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8) " +
+            "ON CONFLICT (tracked_season_id, episode_code, storage_id) DO UPDATE SET " +
+            "file_ids = EXCLUDED.file_ids, size_bytes = EXCLUDED.size_bytes, quality = EXCLUDED.quality, run_id = EXCLUDED.run_id, recorded_at = EXCLUDED.recorded_at",
+          [
+            copy.trackedSeasonId,
+            copy.episodeCode,
+            copy.storageId,
+            JSON.stringify(copy.fileIds),
+            copy.sizeBytes !== null && Number.isFinite(copy.sizeBytes) ? Math.trunc(copy.sizeBytes) : null,
+            copy.quality,
+            copy.runId,
+            copy.recordedAt,
+          ],
+        );
+      }
+    });
+  }
+
+  async listEpisodeCopies(trackedSeasonId: string): Promise<EpisodeCopy[]> {
+    await this.ensureSchema();
+    const result = await this.pool.query<{
+      tracked_season_id: string;
+      episode_code: string;
+      storage_id: string;
+      file_ids: unknown;
+      size_bytes: string | number | null;
+      quality: string | null;
+      run_id: string;
+      recorded_at: string;
+    }>(
+      "SELECT tracked_season_id, episode_code, storage_id, file_ids, size_bytes, quality, run_id, recorded_at " +
+        "FROM episode_copies WHERE tracked_season_id = $1 ORDER BY episode_code, storage_id",
+      [trackedSeasonId],
+    );
+    return result.rows.map((row) => ({
+      trackedSeasonId: String(row.tracked_season_id),
+      episodeCode: String(row.episode_code),
+      storageId: String(row.storage_id),
+      fileIds: Array.isArray(row.file_ids) ? row.file_ids.map(String) : [],
+      sizeBytes: row.size_bytes === null || row.size_bytes === undefined ? null : Number(row.size_bytes),
+      quality: row.quality ?? null,
+      runId: String(row.run_id),
+      recordedAt: String(row.recorded_at),
+    }));
+  }
+
+  async obtainedEpisodesForSeason(
+    trackedSeasonId: string,
+    accountId: string = DEFAULT_ACCOUNT_ID,
+  ): Promise<CrossDriveEpisodeOwnership[]> {
+    await this.ensureSchema();
+    const copies = await this.listEpisodeCopies(trackedSeasonId);
+    const result = await this.pool.query<{
+      connected_storage_id: string;
+      payload: EpisodeState;
+    }>(
+      "SELECT e.connected_storage_id AS connected_storage_id, e.payload AS payload " +
+        "FROM episode_states e " +
+        "JOIN tracked_seasons ts ON e.tracked_season_id = ts.id AND e.connected_storage_id = ts.connected_storage_id " +
+        "WHERE e.tracked_season_id = $1 AND ts.account_id = $2",
+      [trackedSeasonId, accountId],
+    );
+    const byDrive = new Map<string, EpisodeState[]>();
+    for (const row of result.rows) {
+      const list = byDrive.get(row.connected_storage_id) ?? [];
+      list.push(row.payload);
+      byDrive.set(row.connected_storage_id, list);
+    }
+    const ownedStorages = new Set(
+      (await this.listConnectedStorages(accountId)).map((s) => s.id),
+    );
+    for (const sid of byDrive.keys()) {
+      if (sid !== UNSCOPED_STORAGE) ownedStorages.add(sid);
+    }
+    return buildCrossDriveEpisodeOwnership({
+      driveEpisodeBuckets: [...byDrive.entries()].map(([storageId, episodes]) => ({
+        storageId,
+        episodes,
+      })),
+      copies,
+      ownedStorageIds: ownedStorages,
+      unscopedStorageSentinel: UNSCOPED_STORAGE,
+    });
   }
 
   async recordDeadLink(input: {

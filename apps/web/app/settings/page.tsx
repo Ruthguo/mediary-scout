@@ -79,7 +79,15 @@ import {
   resolveGlobalWorkspace,
   resolveIsDesktop,
 } from "../../lib/workflow-runtime";
-import { brandSupportsProwlarr, brandsSupportingProwlarr, FREE_LLM_PRESET, getStorageBrand, isFreeLlmPreset, isRegisteredStorageProvider } from "@media-track/workflow";
+import {
+  brandSupportsProwlarr,
+  brandsSupportingProwlarr,
+  formatDriveSpaceSummary,
+  FREE_LLM_PRESET,
+  getStorageBrand,
+  isFreeLlmPreset,
+  isRegisteredStorageProvider,
+} from "@media-track/workflow";
 import { isDemoMode } from "../../lib/demo-mode";
 
 export default function SettingsPage({
@@ -700,7 +708,7 @@ function providerLabel(provider: string): string {
 async function Pan115Section() {
   await connection();
   const status = await getPan115ConnectionStatus();
-  const drives = await getAccountConnectedStorages();
+  const drives = await getAccountConnectedStorages({ includeSpace: true });
 
   return (
     <section className="panel" style={{ maxWidth: 720 }}>
@@ -710,7 +718,7 @@ async function Pan115Section() {
             <Cable size={16} aria-hidden style={{ verticalAlign: "-2px", marginRight: 8 }} />
             网盘连接
           </h2>
-          <p className="panel-note">每块盘是独立工作区，左上角可切换；凭证入库后自动用于转存</p>
+          <p className="panel-note">多块网盘统一协作：根据资源画质与剩余空间自动入库，单盘能收齐绝不拆盘</p>
         </div>
         {(() => {
           // #93: derive the header badge from ALL drives — 115-only status made
@@ -738,6 +746,24 @@ async function Pan115Section() {
           {drives.map((drive) => {
             const frozen = drive.status === "frozen";
             const ready = !frozen && drive.provisioned;
+            const spaceSummary = formatDriveSpaceSummary(drive.space);
+            let dotTitle = "目录待建";
+            let dotAriaLabel = "目录待建";
+            if (frozen) {
+              dotTitle = "凭证已失效，重新绑定同一账号即可恢复";
+              dotAriaLabel = "掉线";
+            } else if (ready) {
+              dotTitle = "目录已就绪";
+              dotAriaLabel = "就绪";
+            }
+            let statusMetaNode = <span>就绪</span>;
+            if (frozen) {
+              statusMetaNode = <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>;
+            } else if (!drive.provisioned) {
+              statusMetaNode = <span className="tone-amber-text">目录待建</span>;
+            } else if (drive.connectedAt) {
+              statusMetaNode = <span>{drive.connectedAt.slice(0, 10)} 连接</span>;
+            }
             return (
               <div key={drive.id} className={`drive-card${frozen ? " is-frozen" : ""}`}>
                 <div className="drive-card-head">
@@ -753,23 +779,19 @@ async function Pan115Section() {
                   <span
                     className={`drive-dot ${ready ? "green" : "amber"}`}
                     role="img"
-                    title={frozen ? "凭证已失效，重新绑定同一账号即可恢复" : ready ? "目录已就绪" : "目录待建"}
-                    aria-label={frozen ? "掉线" : ready ? "就绪" : "目录待建"}
+                    title={dotTitle}
+                    aria-label={dotAriaLabel}
                   />
                 </div>
                 <div className="drive-card-uid" title={drive.providerUid}>
                   {maskProviderUid(drive.providerUid)}
                 </div>
                 <div className="drive-card-meta">
-                  {frozen ? (
-                    <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>
-                  ) : !drive.provisioned ? (
-                    <span className="tone-amber-text">目录待建</span>
-                  ) : drive.connectedAt ? (
-                    <span>{drive.connectedAt.slice(0, 10)} 连接</span>
-                  ) : (
-                    <span>就绪</span>
-                  )}
+                  {statusMetaNode}
+                  <span> · </span>
+                  <span className={spaceSummary.overQuota ? "tone-amber-text" : undefined}>
+                    {spaceSummary.badgeText}
+                  </span>
                 </div>
                 <div className="drive-card-actions">
                   <TestConnectionButton storageId={drive.id} />
@@ -784,7 +806,7 @@ async function Pan115Section() {
       <p className="panel-note drive-add-heading">
         {drives.length > 0 ? "添加网盘 · 选择品牌开始连接" : "添加你的第一块网盘"}
         {drives.length > 0 ? (
-          <span className="drive-add-hint">不同账号即新增一块独立工作区；绑已连的同一账号会自动刷新登录</span>
+          <span className="drive-add-hint">不同账号即新增一块可用网盘；绑已连的同一账号会自动刷新登录</span>
         ) : null}
       </p>
       <AddDriveBrandTabs defaultBrand={drives.length > 0 ? null : "pan115"} />

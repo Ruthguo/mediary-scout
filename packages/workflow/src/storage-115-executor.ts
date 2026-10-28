@@ -144,6 +144,7 @@ export interface Pan115StorageApi {
   moveItems(input: { fileIds: string[]; targetDirectoryId: string }): Promise<Pan115ActionResult>;
   deleteItems(input: { fileIds: string[] }): Promise<Pan115ActionResult>;
   renameFile(input: { fileId: string; newName: string }): Promise<Pan115ActionResult>;
+  getSpace?(): Promise<{ totalBytes: number; usedBytes: number } | null>;
 }
 
 export interface Storage115ExecutorOptions {
@@ -531,6 +532,14 @@ export class Storage115Executor implements StorageExecutor {
    *  stop line for subtitle landing polls — polling must never eat the reserve. */
   apiTransferCallBudget(): number {
     return this.apiGuard.transferCallBudget();
+  }
+
+  async getSpace(): Promise<{ totalBytes: number; usedBytes: number } | null> {
+    const getSpace = this.api.getSpace;
+    if (!getSpace) {
+      return null;
+    }
+    return this.callApi("getSpace", () => getSpace.call(this.api));
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {
@@ -1165,16 +1174,13 @@ export class Storage115Executor implements StorageExecutor {
       return this.callApi("addOfflineTask", () => this.api.addOfflineTask({ url, directoryId }));
     }
 
-    if (url.startsWith("https://115.com/s/") || url.startsWith("https://115cdn.com/s/")) {
-      const parsed = parseShareUrl(url);
-      if (!parsed) {
-        return { ok: false, message: "invalid 115 share link" };
-      }
+    const parsedShare = parsePan115ShareUrl(url);
+    if (parsedShare) {
       const payloadPassword = stringValue(candidate.providerPayload["password"]);
       return this.callApi("receiveShare", () =>
         this.api.receiveShare({
-          shareCode: parsed.shareCode,
-          receiveCode: payloadPassword || parsed.receiveCode,
+          shareCode: parsedShare.shareCode,
+          receiveCode: payloadPassword || parsedShare.receiveCode,
           directoryId,
         }),
       );
@@ -1611,8 +1617,11 @@ function transferMessage(
   return "";
 }
 
-function parseShareUrl(url: string): { shareCode: string; receiveCode: string } | null {
-  const match = /\/s\/([A-Za-z0-9]+)(?:\?([^#]+))?/.exec(url);
+const PAN115_SHARE_HOST_PATTERN =
+  /^\s*(?:https?:\/\/)?(?:www\.)?(?:115\.com|115cdn\.com|anxia\.com)\/s\/([A-Za-z0-9]+)(?:\?([^#]+))?/i;
+
+export function parsePan115ShareUrl(url: string): { shareCode: string; receiveCode: string } | null {
+  const match = PAN115_SHARE_HOST_PATTERN.exec(url);
   if (!match?.[1]) {
     return null;
   }

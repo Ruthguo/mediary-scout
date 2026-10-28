@@ -24,7 +24,32 @@ export interface UnparsedVideoFile {
   sizeBytes: number;
 }
 
+export interface DriveSpaceInfo {
+  totalBytes: number;
+  usedBytes: number;
+}
+
+/** One active drive available to a unified multi-drive acquisition run, ordered by
+ *  the user's preference (`drive_order` setting, falling back to `created_at`). */
+export interface AcquisitionDriveContext {
+  storageId: string;
+  provider: string;
+  label: string;
+  storage: StorageExecutor;
+  parents: {
+    tv: string;
+    anime: string;
+    movies: string;
+  };
+  /** Cached or freshly-probed drive capacity at run start. Null when unknown. */
+  space: DriveSpaceInfo | null;
+}
+
 export interface StorageExecutor {
+  /** Query the drive's total and used space in bytes. `totalBytes - usedBytes` may
+   *  be negative when a drive is over-quota (e.g. expired SVIP). Returns null on a
+   *  non-auth failure or when the fake/simulator does not implement it. */
+  getSpace?(): Promise<DriveSpaceInfo | null>;
   createDirectory(input: { name: string; parentId: string }): Promise<string>;
   listVideoFiles(directoryId: string): Promise<VerifiedFile[]>;
   /** Video files in the directory whose names expose no parseable episode code. */

@@ -10,7 +10,7 @@ import type {
   TrackedSeason,
   WorkflowStatus,
 } from "./domain.js";
-import type { ResourceProvider, StorageExecutor } from "./ports.js";
+import type { AcquisitionDriveContext, ResourceProvider, StorageExecutor } from "./ports.js";
 import type { PersistedWorkflowRunSnapshot, QueueClaimOptions, WorkflowRepository } from "./repository.js";
 import {
   AUTO_REQUEUE_BACKOFF_MS,
@@ -113,6 +113,7 @@ export async function resolveWorkerDeps(
   storageParentDirectoryId: string | undefined;
   animeStorageParentDirectoryId: string | undefined;
   moviesParentDirectoryId: string | undefined;
+  drives: AcquisitionDriveContext[] | undefined;
 }> {
   const ctx = resolve ? await resolve(accountId, connectedStorageId) : {};
   return {
@@ -143,6 +144,7 @@ export async function resolveWorkerDeps(
       ctx.animeStorageParentDirectoryId ?? base.animeStorageParentDirectoryId,
     moviesParentDirectoryId:
       ctx.moviesParentDirectoryId ?? base.moviesParentDirectoryId,
+    drives: ctx.drives ?? base.drives,
   };
 }
 
@@ -194,6 +196,8 @@ export interface AccountWorkerContext {
   storageParentDirectoryId?: string;
   animeStorageParentDirectoryId?: string;
   moviesParentDirectoryId?: string;
+  /** Ordered active drives for this account in unified multi-drive mode. */
+  drives?: AcquisitionDriveContext[];
 }
 
 export type ResolveAccountWorkerContext = (
@@ -524,6 +528,7 @@ export async function runQueuedType2Workflow(input: {
         ...(deps.titleResearch === undefined
           ? {}
           : { titleResearch: deps.titleResearch }),
+      ...(deps.drives === undefined ? {} : { drives: deps.drives }),
       // finishedAt is stamped post-run inside the persist step (see runner-v2),
       // so it reflects actual completion, not the claim time.
       workflowRun: {
@@ -689,13 +694,17 @@ export async function runScheduledType3Monitoring(input: {
       busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
     }
   }
-  const patrolStates: typeof trackedStates = [];
+  const patrolStatesBySeasonKey = new Map<string, (typeof trackedStates)[number]>();
   for (const s of trackedStates) {
     const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
     if (requestKeys.has(key) || busyKeys.has(key)) continue;
     if (await onFrozenDrive(s.accountId, s.connectedStorageId)) continue;
-    patrolStates.push(s);
+    const seasonKey = `${s.accountId}::${s.season.id}`;
+    if (!patrolStatesBySeasonKey.has(seasonKey)) {
+      patrolStatesBySeasonKey.set(seasonKey, s);
+    }
   }
+  const patrolStates = [...patrolStatesBySeasonKey.values()];
   for (const [drive, count] of skippedOnFrozen) {
     console.log(`[patrol] drive ${drive} is frozen (login expired): skipped ${count} item(s) until it is re-bound`);
   }
@@ -782,6 +791,23 @@ async function patrolTrackedState(args: {
       }
     }
 
+    let patrolEpisodes = episodes;
+    if (input.repository.obtainedEpisodesForSeason) {
+      const crossDrive = await input.repository.obtainedEpisodesForSeason(
+        season.id,
+        state.accountId,
+      );
+      if (crossDrive.length > 0) {
+        const obtainedCodes = new Set(
+          crossDrive.filter((c) => c.obtained).map((c) => c.episodeCode),
+        );
+        patrolEpisodes = episodes.map((ep) => ({
+          ...ep,
+          obtained: ep.obtained || obtainedCodes.has(ep.episodeCode),
+        }));
+      }
+    }
+
     const workflowRunId = input.createWorkflowRunId?.() ?? crypto.randomUUID();
     const startedAt = now();
     const staleActiveRunStartedBefore = staleStartedBefore(
@@ -839,7 +865,7 @@ async function patrolTrackedState(args: {
       runType3MonitoringV2AndPersist({
         title: state.title,
         season,
-        episodes,
+        episodes: patrolEpisodes,
         categoryParentId: requireCategoryParent(
           storageParentForTitle(
             state.title,
@@ -875,6 +901,7 @@ async function patrolTrackedState(args: {
           ...(deps.titleResearch === undefined
             ? {}
             : { titleResearch: deps.titleResearch }),
+        ...(deps.drives === undefined ? {} : { drives: deps.drives }),
         workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
         now,
       });
@@ -976,6 +1003,7 @@ async function patrolMovie(args: {
     agentMemory: boolean | undefined;
     titleResearch: TitleResearchOptions | undefined;
     moviesParentDirectoryId: string | undefined;
+    drives: AcquisitionDriveContext[] | undefined;
   };
   state: {
     accountId: string;
@@ -991,7 +1019,14 @@ async function patrolMovie(args: {
   if (moviesParent === undefined) {
     return null;
   }
-  const obtained = state.episodes.some((episode) => episode.obtained);
+  let obtained = state.episodes.some((episode) => episode.obtained);
+  if (!obtained && input.repository.obtainedEpisodesForSeason) {
+    const crossDrive = await input.repository.obtainedEpisodesForSeason(
+      state.season.id,
+      state.accountId,
+    );
+    obtained = crossDrive.some((c) => c.obtained);
+  }
   if (obtained) {
     return null;
   }
@@ -1082,6 +1117,7 @@ async function patrolMovie(args: {
         ...(deps.titleResearch === undefined
           ? {}
           : { titleResearch: deps.titleResearch }),
+      ...(deps.drives === undefined ? {} : { drives: deps.drives }),
       // Reported in the sweep's daily digest, like the shows, not pushed on its own.
       notice: { trigger: "scheduled", routineIfNothingReplaced: false },
       workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
@@ -1261,6 +1297,7 @@ export async function runQueuedMovieAcquisition(input: {
         ...(deps.titleResearch === undefined
           ? {}
           : { titleResearch: deps.titleResearch }),
+      ...(deps.drives === undefined ? {} : { drives: deps.drives }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,
@@ -1382,6 +1419,7 @@ export async function runQueuedSeriesInitialization(input: {
         ...(deps.titleResearch === undefined
           ? {}
           : { titleResearch: deps.titleResearch }),
+      ...(deps.drives === undefined ? {} : { drives: deps.drives }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,
