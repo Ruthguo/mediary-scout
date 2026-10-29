@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  FREE_LLM_PRESET,
   createAgentModel,
   createAgentProviderConfig,
   createAgentModelFromEnv,
+  isFreeLlmPreset,
   llmConfigError,
   normalizeLlmBaseUrl,
   sanitizeLlmApiKey,
@@ -15,9 +17,12 @@ import {
  * interrogation script uses it. Losing it breaks live e2e at runtime even though
  * tsc stayed green (the web typechecked against a stale dist .d.ts).
  *
- * BYO model: the factory is model-AGNOSTIC. baseURL + modelId are REQUIRED;
- * apiKey is OPTIONAL (keyless local LLMs — ollama/LM Studio — are valid). There
- * is NO silent MiMo default (issue #49).
+ * BYO model: the factory is model-AGNOSTIC. Explicit config still requires
+ * baseURL + modelId; apiKey is OPTIONAL (keyless local LLMs — ollama/LM Studio
+ * — are valid). When env configures NOTHING the env-resolution layer falls back
+ * to FREE_LLM_PRESET (Kilo 免费池) — an informed, explicit factory default that
+ * is visible/editable in 设置 → AI 模型, not the old silent author default
+ * (issue #49 反的是后者).
  */
 describe("agent-model — the live OpenAI-compatible (BYO) LanguageModel factory", () => {
   it("maps explicit options onto provider settings (no invented defaults)", () => {
@@ -121,8 +126,108 @@ describe("agent-model — the live OpenAI-compatible (BYO) LanguageModel factory
     expect((fallback as { modelId?: string }).modelId).toBe("mimo-v2.5-pro");
   });
 
-  it("throws (no silent default) when env configures nothing", () => {
-    expect(() => createAgentModelFromEnv({} as NodeJS.ProcessEnv)).toThrow();
+  // Copilot r2 A：出厂 .env.example 带三个空串 AGENT_MODEL_* 键 —— 部署若同时
+  // 保留有值的 XIAOMI_MIMO_*，空 modern 键不能遮蔽 legacy 值。?? 链把空串当
+  // 有效值，会让「三键全空→免费预设」判定把 legacy 配置静默换成 Kilo；每对
+  // modern/legacy 键必须取第一个非空白值。
+  it("blank AGENT_MODEL_* strings do NOT shadow a configured XIAOMI_MIMO_* env (first non-blank wins)", () => {
+    const model = createAgentModelFromEnv({
+      AGENT_MODEL_BASE_URL: "",
+      AGENT_MODEL_ID: "",
+      XIAOMI_MIMO_BASE_URL: "https://x/v1",
+      XIAOMI_MIMO_MODEL_ID: "m",
+    } as NodeJS.ProcessEnv);
+    expect((model as { modelId?: string }).modelId).toBe("m");
+    const endpoint = (
+      model as unknown as {
+        config: { url: (o: { path: string }) => string };
+      }
+    ).config.url({ path: "/chat/completions" });
+    expect(endpoint).toBe("https://x/v1/chat/completions");
+  });
+
+  // 出厂回落（免费内置模型）：env 三键全空（未设或空串）→ 不再抛「未配置」，
+  // 构造 Kilo 免费池模型。@ai-sdk/openai-compatible 把 endpoint 藏在私有
+  // config.url 里 —— 从 model 上取它来断言 provider baseURL 真的是 Kilo 网关。
+  it("falls back to FREE_LLM_PRESET (Kilo 免费池) when env configures nothing", () => {
+    const model = createAgentModelFromEnv({} as NodeJS.ProcessEnv);
+    expect((model as { modelId?: string }).modelId).toBe(FREE_LLM_PRESET.modelId);
+    expect((model as { modelId?: string }).modelId).toBe(
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+    );
+    const endpoint = (
+      model as unknown as {
+        config: { url: (o: { path: string }) => string };
+      }
+    ).config.url({ path: "/chat/completions" });
+    expect(endpoint).toBe("https://api.kilo.ai/api/gateway/chat/completions");
+    // 免费池无 key：回落模型不能带任何鉴权头（Kilo 无 key 直连是设计前提）。
+    const headers = (
+      model as unknown as {
+        config: { headers: () => Record<string, string> };
+      }
+    ).config.headers();
+    expect(headers["Authorization"]).toBeUndefined();
+    expect(headers["api-key"]).toBeUndefined();
+  });
+
+  // .env.example 出厂就是三个空串键 —— 复制不改的环境文件是「未配置」的
+  // 最常见形态，必须同样回落（空串 = 没配置，不是半截配置）。
+  it("falls back when env has the .env.example pattern: three BLANK-STRING keys", () => {
+    const model = createAgentModelFromEnv({
+      AGENT_MODEL_API_KEY: "",
+      AGENT_MODEL_BASE_URL: "",
+      AGENT_MODEL_ID: "",
+    } as NodeJS.ProcessEnv);
+    expect((model as { modelId?: string }).modelId).toBe(FREE_LLM_PRESET.modelId);
+  });
+
+  // Copilot r4 High：env 显式配置的 baseURL/modelId 逐字等于 FREE_LLM_PRESET
+  // 且带非空 key —— 三键非全空 → 不走回落分支 → key 被拷进 options → 以
+  // Authorization Bearer + api-key 两个鉴权头发给 Kilo。web 解析层
+  // （resolveAgentModelConfig）已守同一不变量（生效值==预设 → 丢 key），env
+  // 直连工厂服务 worker 直连 / CLI / §6a 脚本，必须同样防护：
+  // preset-valued configs never carry a key。
+  it("drops a residual apiKey when env EXPLICITLY equals the free preset (never send a key to the free pool)", () => {
+    const model = createAgentModelFromEnv({
+      AGENT_MODEL_API_KEY: "sk-residual",
+      AGENT_MODEL_BASE_URL: FREE_LLM_PRESET.baseURL,
+      AGENT_MODEL_ID: FREE_LLM_PRESET.modelId,
+    } as NodeJS.ProcessEnv);
+    expect((model as { modelId?: string }).modelId).toBe(FREE_LLM_PRESET.modelId);
+    const endpoint = (
+      model as unknown as {
+        config: { url: (o: { path: string }) => string };
+      }
+    ).config.url({ path: "/chat/completions" });
+    expect(endpoint).toBe(`${FREE_LLM_PRESET.baseURL}/chat/completions`);
+    // 免费池无 key：残留 key 不得以任何鉴权头发给 Kilo。@ai-sdk 2.0.48 会把
+    // 头名规范化为小写（authorization），大小写两种形态都要断言到。
+    const headers = (
+      model as unknown as {
+        config: { headers: () => Record<string, string> };
+      }
+    ).config.headers();
+    expect(headers["Authorization"]).toBeUndefined();
+    expect(headers["authorization"]).toBeUndefined();
+    expect(headers["api-key"]).toBeUndefined();
+  });
+
+  // 半截 env 是用户错误，不该静默变成免费池（行为与改动前一致）。
+  it("still throws on a HALF-configured env (baseURL without modelId)", () => {
+    expect(() =>
+      createAgentModelFromEnv({
+        AGENT_MODEL_BASE_URL: "https://example.test/v1",
+      } as NodeJS.ProcessEnv),
+    ).toThrow();
+  });
+
+  it("still throws on a HALF-configured env (only an apiKey)", () => {
+    expect(() =>
+      createAgentModelFromEnv({
+        AGENT_MODEL_API_KEY: "sk-x",
+      } as NodeJS.ProcessEnv),
+    ).toThrow();
   });
 });
 
@@ -161,6 +266,73 @@ describe("llmConfigError — agnostic, BYO required-config predicate", () => {
   });
 });
 
+describe("FREE_LLM_PRESET — 出厂免费预设（Kilo Code 公共免费池）", () => {
+  // 逐字锁定（计划 Global Constraint）：这两个值是设计决策的产物，改动必须走
+  // 设计复核并随发版更新 —— 测试钉死防止手滑改错一个字符。
+  it("pins the verbatim factory values", () => {
+    expect(FREE_LLM_PRESET.baseURL).toBe("https://api.kilo.ai/api/gateway");
+    expect(FREE_LLM_PRESET.modelId).toBe("nvidia/nemotron-3-ultra-550b-a55b:free");
+  });
+
+  // 预设自身的 baseURL 必须已是 normalize 后形态，isFreeLlmPreset 的逐字比较才自反。
+  it("matches itself via isFreeLlmPreset (reflexive)", () => {
+    expect(isFreeLlmPreset(FREE_LLM_PRESET)).toBe(true);
+  });
+});
+
+describe("isFreeLlmPreset — normalize 后逐字比较；blank 输入返回 false", () => {
+  it("matches the exact preset", () => {
+    expect(
+      isFreeLlmPreset({
+        baseURL: "https://api.kilo.ai/api/gateway",
+        modelId: "nvidia/nemotron-3-ultra-550b-a55b:free",
+      }),
+    ).toBe(true);
+  });
+
+  it("matches baseURL variants that normalize to the preset (trailing slash / /chat/completions / surrounding whitespace)", () => {
+    for (const baseURL of [
+      "https://api.kilo.ai/api/gateway/",
+      "https://api.kilo.ai/api/gateway/chat/completions",
+      "  https://api.kilo.ai/api/gateway  ",
+    ]) {
+      expect(isFreeLlmPreset({ baseURL, modelId: FREE_LLM_PRESET.modelId })).toBe(true);
+    }
+  });
+
+  it("matches a modelId with surrounding whitespace (trim)", () => {
+    expect(
+      isFreeLlmPreset({ baseURL: FREE_LLM_PRESET.baseURL, modelId: `  ${FREE_LLM_PRESET.modelId}\t` }),
+    ).toBe(true);
+  });
+
+  it("does NOT match a different baseURL (no fuzzy matching)", () => {
+    expect(
+      isFreeLlmPreset({ baseURL: "https://api.kilo.ai/api/gateway-2", modelId: FREE_LLM_PRESET.modelId }),
+    ).toBe(false);
+    expect(
+      isFreeLlmPreset({ baseURL: "https://evil.example/api/gateway", modelId: FREE_LLM_PRESET.modelId }),
+    ).toBe(false);
+  });
+
+  it("does NOT match a different modelId (no fuzzy matching)", () => {
+    expect(
+      isFreeLlmPreset({ baseURL: FREE_LLM_PRESET.baseURL, modelId: "kilo-auto/free" }),
+    ).toBe(false);
+    expect(
+      isFreeLlmPreset({ baseURL: FREE_LLM_PRESET.baseURL, modelId: "nvidia/nemotron-3-ultra-550b-a55b:free-2" }),
+    ).toBe(false);
+  });
+
+  it("returns false for blank input (missing fields / empty / whitespace-only)", () => {
+    expect(isFreeLlmPreset({})).toBe(false);
+    expect(isFreeLlmPreset({ baseURL: "", modelId: "" })).toBe(false);
+    expect(isFreeLlmPreset({ baseURL: "   ", modelId: "   " })).toBe(false);
+    expect(isFreeLlmPreset({ baseURL: FREE_LLM_PRESET.baseURL, modelId: "" })).toBe(false);
+    expect(isFreeLlmPreset({ baseURL: "", modelId: FREE_LLM_PRESET.modelId })).toBe(false);
+  });
+});
+
 describe("normalizeLlmBaseUrl — provider appends /chat/completions itself", () => {
   it.each([
     ["https://x/v1/chat/completions", "https://x/v1"],
@@ -192,5 +364,124 @@ describe("sanitizeLlmApiKey — strips paste contamination (keys are whitespace-
     const contaminated = `tp-${nbsp}ab${zwsp}c${bom}`;
     expect(contaminated.length).toBeGreaterThan("tp-abc".length);
     expect(sanitizeLlmApiKey(contaminated)).toBe("tp-abc");
+  });
+});
+
+describe("agent-model — HTTP 200 error-envelope normalization (Kilo/OpenRouter gateway quirk)", () => {
+  it("retries in-step via AI SDK and succeeds when a gateway returns HTTP 200 with { error: { code: 503, message } } on attempt 1", async () => {
+    const { generateText } = await import("ai");
+    let calls = 0;
+    const fakeFetch: typeof fetch = async () => {
+      calls += 1;
+      if (calls === 1) {
+        return new Response(
+          JSON.stringify({
+            id: "gen-1791987472-YiskVKGPZU7YDtr5pzVZ",
+            error: {
+              message: "Upstream error from Nvidia: Service temporarily overloaded",
+              code: 503,
+              metadata: { error_type: "provider_overloaded" },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          id: "chatcmpl-ok",
+          model: FREE_LLM_PRESET.modelId,
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: { role: "assistant", content: "recovered" },
+            },
+          ],
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const model = createAgentModel({ ...FREE_LLM_PRESET, fetch: fakeFetch });
+    const result = await generateText({
+      model,
+      maxRetries: 1,
+      prompt: "ping",
+    });
+
+    expect(calls).toBe(2);
+    expect(result.text).toBe("recovered");
+  });
+
+  it("surfaces the real error message and statusCode (not 'Invalid JSON response' / 200) when HTTP 200 error envelope persists", async () => {
+    const { generateText } = await import("ai");
+    const fakeFetch: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          id: "gen-err",
+          error: {
+            message: "Upstream error from Nvidia: Service temporarily overloaded",
+            code: 503,
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+
+    const model = createAgentModel({ ...FREE_LLM_PRESET, fetch: fakeFetch });
+    let caught: unknown;
+    try {
+      await generateText({ model, maxRetries: 0, prompt: "ping" });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const err = caught as { message: string; statusCode?: number; isRetryable?: boolean };
+    expect(err.message).toContain("Upstream error from Nvidia: Service temporarily overloaded");
+    expect(err.message).not.toContain("Invalid JSON response");
+    expect(err.statusCode).toBe(503);
+    expect(err.isRetryable).toBe(true);
+  });
+
+  it("maps an HTTP 200 error envelope without a valid numeric HTTP code (e.g. string code) to 502 Bad Gateway", async () => {
+    const { generateText } = await import("ai");
+    const fakeFetch: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            message: "Provider returned an internal error",
+            code: "provider_error",
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+
+    const model = createAgentModel({ ...FREE_LLM_PRESET, fetch: fakeFetch });
+    let caught: unknown;
+    try {
+      await generateText({ model, maxRetries: 0, prompt: "ping" });
+    } catch (error) {
+      caught = error;
+    }
+
+    const err = caught as { message: string; statusCode?: number; isRetryable?: boolean };
+    expect(err.message).toContain("Provider returned an internal error");
+    expect(err.statusCode).toBe(502);
+    expect(err.isRetryable).toBe(true);
+  });
+
+  it("leaves SSE (text/event-stream) and non-2xx responses untouched without reading their body", async () => {
+    const { providerSettings } = createAgentProviderConfig({
+      ...FREE_LLM_PRESET,
+      fetch: async () =>
+        new Response("data: {\"choices\":[]}\n\n", {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+    });
+    const res = await providerSettings.fetch!("https://api.kilo.ai/api/gateway/chat/completions");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("data: {\"choices\":[]}\n\n");
   });
 });

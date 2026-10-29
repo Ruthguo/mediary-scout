@@ -83,6 +83,7 @@ export interface GuangYaStorageClient {
   listShareFiles?(accessToken: string, parentId: string): Promise<GuangYaStorageItem[]>;
   restoreShare?(input: { accessToken: string; fileIds: string[]; parentId: string }): Promise<string>;
   getTaskStatus?(taskId: string): Promise<{ status: number }>;
+  getSpace?(): Promise<{ totalBytes: number; usedBytes: number } | null>;
 }
 
 export interface GuangYaStorageExecutorOptions {
@@ -144,6 +145,13 @@ export class GuangYaStorageExecutor implements StorageExecutor {
     this.taskPollIntervalMs = options.taskPollIntervalMs ?? 3000;
     this.subtitleTaskPollMaxPolls = options.subtitleTaskPollMaxPolls ?? 16;
     this.subtitleTaskPollIntervalMs = options.subtitleTaskPollIntervalMs ?? 3000;
+  }
+
+  async getSpace(): Promise<{ totalBytes: number; usedBytes: number } | null> {
+    if (!this.client.getSpace) {
+      return null;
+    }
+    return this.client.getSpace();
   }
 
   async createDirectory(input: { name: string; parentId: string }): Promise<string> {
@@ -610,6 +618,25 @@ export class GuangYaStorageExecutor implements StorageExecutor {
     }
     const safeTargetId = this.assertWithinWriteScope(input.targetDirectoryId, "move files into");
     await this.client.moveFiles(input.fileIds, safeTargetId);
+    const wanted = new Set(input.fileIds);
+    const maxPolls = 5;
+    for (let poll = 0; poll < maxPolls; poll += 1) {
+      try {
+        const items = await this.client.listFiles(safeTargetId);
+        const present = new Set(items.map((item) => idOf(item)));
+        if ([...wanted].every((id) => present.has(id))) {
+          break;
+        }
+      } catch {
+        // Ignore transient list errors during post-move settle polling
+      }
+      if (poll + 1 < maxPolls) {
+        const delayMs = Math.min(400, this.taskPollIntervalMs);
+        if (delayMs > 0) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+    }
     return { moved: input.fileIds };
   }
 

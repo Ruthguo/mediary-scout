@@ -7,6 +7,7 @@ import {
   llmPills,
   pansouPills,
   prowlarrPills,
+  haisouPills,
   tmdbPills,
   type ServicePill,
 } from "./service-status";
@@ -68,6 +69,21 @@ describe("llmPills（输入 = resolveAgentModelConfig 的生效值）", () => {
       name: "未配置时不追加 来自环境变量（没有可归属的值）",
       input: { baseURL: "", modelId: "", fromEnv: true },
       want: [{ label: "未配置", tone: "off" }],
+    },
+    {
+      name: "fromFreePreset=true → 单颗 Kilo 免费池 (on)，不显示预设的 modelId",
+      input: { baseURL: "https://free.example.com/v1", modelId: "kilo-free", fromEnv: false, fromFreePreset: true },
+      want: [{ label: "Kilo 免费池", tone: "on" }],
+    },
+    {
+      name: "fromFreePreset=true 时不叠 来自环境变量（免费预设不是 env 补的）",
+      input: { baseURL: "https://free.example.com/v1", modelId: "kilo-free", fromEnv: true, fromFreePreset: true },
+      want: [{ label: "Kilo 免费池", tone: "on" }],
+    },
+    {
+      name: "显式 fromFreePreset=false → 与不传等价，走原判定",
+      input: { baseURL: "https://x/v1", modelId: "mimo-v2.5-pro", fromEnv: false, fromFreePreset: false },
+      want: [{ label: "已配置 · mimo-v2.5-pro", tone: "on" }],
     },
   ])("$name", ({ input, want }) => {
     expect(llmPills(input)).toEqual(want);
@@ -281,5 +297,28 @@ describe("assrtPills", () => {
   it("有 token → 已配置 (on)；无 → 未配置 (off)", () => {
     expect(assrtPills({ tokenSet: true })).toEqual([{ label: "已配置", tone: "on" }]);
     expect(assrtPills({ tokenSet: false })).toEqual([{ label: "未配置", tone: "off" }]);
+  });
+});
+
+describe("haisouPills（输入 = getHaisouApiKey 的生效值）", () => {
+  const QUOTA: ServicePill = { label: "每日 100 次免费", tone: "neutral" };
+  it.each<Case<typeof haisouPills>>([
+    {
+      name: "no key → 未配置",
+      input: { apiKeySet: false, fromEnv: false },
+      want: [{ label: "未配置", tone: "off" }, QUOTA],
+    },
+    {
+      name: "key from DB → 已接入",
+      input: { apiKeySet: true, fromEnv: false },
+      want: [{ label: "已接入", tone: "on" }, QUOTA],
+    },
+    {
+      name: "key from env → 已接入 + 来自环境变量",
+      input: { apiKeySet: true, fromEnv: true },
+      want: [{ label: "已接入", tone: "on" }, ENV, QUOTA],
+    },
+  ])("$name", ({ input, want }) => {
+    expect(haisouPills(input)).toEqual(want);
   });
 });

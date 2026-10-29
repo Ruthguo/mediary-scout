@@ -1,7 +1,9 @@
 import {
   createTmdbMetadataProvider,
+  getStorageBrand,
   getTrackedSeasonStatusView,
   isMovieUnreleased,
+  isRegisteredStorageProvider,
   isUserVisibleWorkflowKind,
   prepareSeriesTarget,
   queueSeriesInitialization,
@@ -23,6 +25,7 @@ import { createTtlMemo } from "./series-target-memo";
 import { InMemoryJsonCache, PostgresMediaSearchCache, type DurableJsonCache } from "./tmdb-cache";
 import {
   ensureDemoSeeded,
+  frozenDriveMessage,
   getAccountScopedSettings,
   getActiveWorkspaceScope,
   getCurrentAccountId,
@@ -31,8 +34,16 @@ import {
   movieTargetFromTmdbId,
   postgresConnectionString,
   queueCandidateTracking,
+  resolveQueueStorage,
   type CandidateTrackingRequestResult,
 } from "./workflow-runtime";
+
+export interface EpisodeDriveBadge {
+  storageId: string;
+  label: string;
+  sizeBytes: number | null;
+  quality: string | null;
+}
 
 export interface TitleHubSeason {
   seasonNumber: number;
@@ -44,7 +55,7 @@ export interface TitleHubSeason {
   obtainedCount: number;
   missingAiredCount: number;
   trackedSeasonId: string | null;
-  episodes: EpisodeStatusCell[];
+  episodes: Array<EpisodeStatusCell & { driveBadges?: EpisodeDriveBadge[] }>;
 }
 
 export type { TitleAggregateState };
@@ -86,6 +97,8 @@ export interface MovieHubView {
    *  of the film is queued or running (a user's replace request keeps the old file)
    *  the state reads 获取中. */
   obtained: boolean;
+  /** Connected drives holding a copy of this movie (populated when obtained). */
+  driveBadges?: EpisodeDriveBadge[];
 }
 
 export type DetailView = TitleHubView | MovieHubView;
@@ -140,7 +153,7 @@ async function loadSeriesTarget(tmdbId: number): Promise<PreparedSeriesTarget | 
   return loadSeriesTargetWithCache(tmdbId, getDurableTargetCache(), async (id) =>
     prepareSeriesTarget({
       tmdbId: id,
-      qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
+      qualityPreference: "4K",
       metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
     }),
   );
@@ -191,8 +204,18 @@ async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | n
       totalEpisodes: season.episodeCount,
       latestAiredEpisode: season.latestAiredEpisode,
     })),
-    keyword: `${candidate.title} ${process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K"}`.trim(),
+    keyword: candidate.title.trim(),
   };
+}
+
+function driveBadgeLabel(provider: string | undefined, fallbackLabel?: string | null): string {
+  if (fallbackLabel && fallbackLabel.trim().length > 0) {
+    return fallbackLabel.trim();
+  }
+  if (provider && isRegisteredStorageProvider(provider)) {
+    return getStorageBrand(provider).label.replace(/\s*网盘$/, "");
+  }
+  return provider ?? "网盘";
 }
 
 export async function getTitleHubView(tmdbId: number, storageId?: string): Promise<TitleHubView | null> {
@@ -208,6 +231,11 @@ export async function getTitleHubView(tmdbId: number, storageId?: string): Promi
     return null;
   }
 
+  const storages = await repository.listConnectedStorages(scope.accountId);
+  const storageMetaById = new Map(
+    storages.map((s) => [s.id, { provider: s.provider, label: s.label }]),
+  );
+
   const dbTitle = trackedStates[0]?.title;
   const meta = {
     title: dbTitle?.title ?? target?.title.title ?? `TMDB ${tmdbId}`,
@@ -218,7 +246,20 @@ export async function getTitleHubView(tmdbId: number, storageId?: string): Promi
     backdropPath: dbTitle?.backdropPath ?? target?.title.backdropPath ?? null,
   };
 
-  const trackedBySeason = new Map(trackedStates.map((state) => [state.season.seasonNumber, state]));
+  // Deduplicate tracked states by seasonNumber: when multiple drives track the same
+  // season, getTrackedSeasonStatusView with scope.connectedStorageId === null merges
+  // their obtained episodes across drives via obtainedEpisodesForSeason.
+  const trackedBySeason = new Map<number, (typeof trackedStates)[number]>();
+  const statesBySeason = new Map<number, typeof trackedStates>();
+  for (const state of trackedStates) {
+    const list = statesBySeason.get(state.season.seasonNumber) ?? [];
+    list.push(state);
+    statesBySeason.set(state.season.seasonNumber, list);
+    const prev = trackedBySeason.get(state.season.seasonNumber);
+    if (!prev || state.season.latestAiredEpisode > prev.season.latestAiredEpisode) {
+      trackedBySeason.set(state.season.seasonNumber, state);
+    }
+  }
   const seasonNumbers = [
     ...new Set([
       ...(target?.seasons.map((season) => season.seasonNumber) ?? []),
@@ -231,24 +272,40 @@ export async function getTitleHubView(tmdbId: number, storageId?: string): Promi
     const tracked = trackedBySeason.get(seasonNumber);
     const targetSeason = target?.seasons.find((season) => season.seasonNumber === seasonNumber);
     if (tracked) {
-      // Scope to THIS workspace's drive: the same season can be tracked on
-      // several drives (醒来 on 123 21/22 and on 115 0/22), and an unscoped
-      // lookup returned the other drive's episodes on the detail page.
+      const seasonGroup = statesBySeason.get(seasonNumber) ?? [tracked];
       const view = await getTrackedSeasonStatusView({
         repository,
         trackedSeasonId: tracked.season.id,
         scope,
       });
+      const episodesWithBadges = (view?.episodes ?? []).map((ep) => {
+        const driveBadges: EpisodeDriveBadge[] = (ep.drives ?? []).map((d) => {
+          const metaInfo = storageMetaById.get(d.storageId);
+          return {
+            storageId: d.storageId,
+            label: driveBadgeLabel(metaInfo?.provider, metaInfo?.label),
+            sizeBytes: d.sizeBytes,
+            quality: d.quality,
+          };
+        });
+        return driveBadges.length > 0 ? { ...ep, driveBadges } : ep;
+      });
+      const totalEpisodes = tracked.season.totalEpisodes;
+      const latestAiredEpisode = tracked.season.latestAiredEpisode;
+      const airedCount = Math.min(latestAiredEpisode, totalEpisodes);
+      const obtainedCount = view?.obtainedCount ?? 0;
+      const allAiredObtained = totalEpisodes > 0 && latestAiredEpisode >= totalEpisodes && obtainedCount >= airedCount;
+      const allCompleted = seasonGroup.every((s) => s.season.status === "completed");
       seasons.push({
         seasonNumber,
-        totalEpisodes: tracked.season.totalEpisodes,
-        latestAiredEpisode: tracked.season.latestAiredEpisode,
+        totalEpisodes,
+        latestAiredEpisode,
         tracked: true,
-        status: tracked.season.status === "completed" ? "completed" : "active",
-        obtainedCount: view?.obtainedCount ?? 0,
+        status: allCompleted || allAiredObtained ? "completed" : "active",
+        obtainedCount,
         missingAiredCount: view?.missingAiredCount ?? 0,
         trackedSeasonId: tracked.season.id,
-        episodes: view?.episodes ?? [],
+        episodes: episodesWithBadges,
       });
     } else if (targetSeason) {
       seasons.push({
@@ -307,15 +364,41 @@ export async function getDetailView(
   const trackedForTitle = (await repository.listTrackedSeasonStates(scope)).filter(
     (state) => state.title.tmdbId === tmdbId,
   );
-  const movieState = trackedForTitle.find((state) => state.title.type === "movie");
-  if (movieState) {
+  const movieStates = trackedForTitle.filter((state) => state.title.type === "movie");
+  if (movieStates.length > 0) {
+    const movieState = movieStates[0]!;
     const acquiring = (await repository.listActiveWorkflowRuns(scope)).some(
       (snapshot) => snapshot.title.tmdbId === tmdbId && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
     );
-    const obtained = movieState.episodes.some((episode) => episode.obtained);
+    let obtained = movieStates.some((s) => s.episodes.some((episode) => episode.obtained));
+    const driveBadges: EpisodeDriveBadge[] = [];
+    if (repository.obtainedEpisodesForSeason) {
+      const storages = await repository.listConnectedStorages(scope.accountId);
+      const storageMetaById = new Map(
+        storages.map((s) => [s.id, { provider: s.provider, label: s.label }]),
+      );
+      const union = await repository.obtainedEpisodesForSeason(movieState.season.id, scope.accountId);
+      if (scope.connectedStorageId === null && union.some((c) => c.obtained)) {
+        obtained = true;
+      }
+      for (const row of union) {
+        if (!row.obtained) continue;
+        for (const d of row.drives) {
+          if (scope.connectedStorageId !== null && d.storageId !== scope.connectedStorageId) continue;
+          if (driveBadges.some((b) => b.storageId === d.storageId)) continue;
+          const metaInfo = storageMetaById.get(d.storageId);
+          driveBadges.push({
+            storageId: d.storageId,
+            label: driveBadgeLabel(metaInfo?.provider, metaInfo?.label),
+            sizeBytes: d.sizeBytes,
+            quality: d.quality,
+          });
+        }
+      }
+    }
     const reserved = isMovieUnreleased(movieState.title.releaseDate, now);
     const state = acquiring ? "acquiring" : reserved ? "reserved" : obtained ? "acquired" : "missing";
-    return movieHubViewFromTitle(movieState.title, state, acquiring, obtained);
+    return movieHubViewFromTitle(movieState.title, state, acquiring, obtained, driveBadges);
   }
 
   // Untracked title: TMDB's movie/tv id namespaces collide (movie 278 ≠ tv 278).
@@ -353,6 +436,7 @@ function movieHubViewFromTitle(
   state: MovieHubView["state"],
   acquiring: boolean,
   obtained: boolean,
+  driveBadges?: EpisodeDriveBadge[],
 ): MovieHubView {
   return {
     kind: "movie",
@@ -367,6 +451,7 @@ function movieHubViewFromTitle(
     state,
     acquiring,
     obtained,
+    ...(driveBadges && driveBadges.length > 0 ? { driveBadges } : {}),
   };
 }
 
@@ -411,13 +496,20 @@ export async function queueRemainingSeasons(
       trackedSeasonId: `tmdb_tv_${tmdbId}_s${target.seasons[0]?.seasonNumber ?? 1}`,
     };
   }
+  const queueWorkspace = await resolveQueueStorage(scope.accountId, scope.connectedStorageId);
+  if (queueWorkspace.unknown) {
+    return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
+  }
+  if (queueWorkspace.frozen) {
+    return { status: "unsupported", message: frozenDriveMessage(queueWorkspace.provider, "获取") };
+  }
   const request = await queueSeriesInitialization({
     title: target.title,
     seasons: remaining,
     keyword: target.keyword,
     repository,
     accountId: scope.accountId,
-    connectedStorageId: scope.connectedStorageId,
+    connectedStorageId: queueWorkspace.id,
   });
   return {
     status: request.status === "queued" ? "queued" : request.status,
@@ -483,11 +575,34 @@ export async function getLibraryWall(storageId?: string): Promise<LibraryWallEnt
     let aired = 0;
     let total = 0;
     let anyActive = false;
+    // Group by seasonNumber so a season split across multiple drives is counted once,
+    // with its obtained episodes unioned across drives.
+    const bySeasonNum = new Map<number, typeof titleStates>();
     for (const state of titleStates) {
-      aired += Math.min(state.season.latestAiredEpisode, state.season.totalEpisodes);
-      total += state.season.totalEpisodes;
-      obtained += state.episodes.filter((episode) => episode.obtained).length;
-      if (state.season.status === "active") {
+      const list = bySeasonNum.get(state.season.seasonNumber) ?? [];
+      list.push(state);
+      bySeasonNum.set(state.season.seasonNumber, list);
+    }
+    for (const seasonStates of bySeasonNum.values()) {
+      const primary = seasonStates.reduce((best, cur) =>
+        cur.season.latestAiredEpisode > best.season.latestAiredEpisode ? cur : best,
+      );
+      const seasonAired = Math.min(primary.season.latestAiredEpisode, primary.season.totalEpisodes);
+      aired += seasonAired;
+      total += primary.season.totalEpisodes;
+      const obtainedCodes = new Set<string>();
+      for (const s of seasonStates) {
+        for (const ep of s.episodes) {
+          if (ep.obtained) obtainedCodes.add(ep.episodeCode);
+        }
+      }
+      const seasonObtained = obtainedCodes.size;
+      obtained += seasonObtained;
+      const allAiredObtained =
+        primary.season.totalEpisodes > 0 &&
+        primary.season.latestAiredEpisode >= primary.season.totalEpisodes &&
+        seasonObtained >= seasonAired;
+      if (!allAiredObtained && seasonStates.some((s) => s.season.status === "active")) {
         anyActive = true;
       }
     }
@@ -500,7 +615,7 @@ export async function getLibraryWall(storageId?: string): Promise<LibraryWallEnt
       year: title.year,
       type: title.type,
       posterPath,
-      seasonCount: titleStates.length,
+      seasonCount: bySeasonNum.size,
       obtainedEpisodes: obtained,
       totalAiredEpisodes: aired,
       totalEpisodes: total,

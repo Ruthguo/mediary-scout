@@ -15,13 +15,14 @@ import type { ResourceType } from "./domain.js";
 import { isGuangYaAuthError, parseGuangYaUid } from "./guangya-client.js";
 import { isPan115AuthError } from "./pan115-cookie-client.js";
 import { isPan123AuthError, parsePan123Uid } from "./pan123-client.js";
-import { isQuarkAuthError, parseQuarkUid } from "./quark-cookie-client.js";
+import { isQuarkAuthError, parseCloudDriveUid, parseQuarkUid } from "./quark-cookie-client.js";
 import { isTianyiAuthError, parseTianyiUid } from "./tianyi-client.js";
 
-export type StorageProvider = "pan115" | "quark" | "guangya" | "tianyi" | "pan123";
+export type StorageProvider = "pan115" | "quark" | "uc" | "guangya" | "tianyi" | "pan123";
 export type ResourceProviderKind =
   | "pansou-115"
   | "pansou-quark"
+  | "pansou-uc"
   | "pansou-magnet"
   | "pansou-tianyi"
   | "pansou-123"
@@ -67,6 +68,12 @@ export interface StorageBrand {
    *  key is present (the client trims/validates the rest downstream). Undefined
    *  for cookie brands (115/夸克), which authenticate with a cookie string. */
   requiredCredentialKeys?: string[];
+  /** How the brand's executor decides a write is inside the drive's scope.
+   *  "parents": it looks the target's parents up on the drive until it reaches a scope
+   *  root (115 / 夸克). "listed": it only writes into a scope root, a dir it created, or
+   *  a dir it listed under an in-scope parent in this run (光鸭 / 天翼 / 123) — a dir id
+   *  handed over from another run must be reached again from a scope root first. */
+  writeScope: "parents" | "listed";
 }
 
 export const STORAGE_BRANDS: StorageBrand[] = [
@@ -79,6 +86,7 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     assumeChineseSubsFromChineseTitle: true,
     authKind: "cookie",
     provisionRootId: "0", // 115 account root
+    writeScope: "parents",
   },
   {
     provider: "quark",
@@ -89,6 +97,23 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     assumeChineseSubsFromChineseTitle: true,
     authKind: "cookie",
     provisionRootId: "0", // 夸克 account root
+    writeScope: "parents",
+  },
+  {
+    // UC joined 2026-10-23: the SAME Alibaba family protocol as 夸克 (share
+    // token → detail → save → poll, identical envelope, identical 31001 auth
+    // code, identical cookie key names) — verified live end-to-end. Share links
+    // only, like 夸克: UC's magnet/offline API is gated behind a runtime-injected
+    // window.encryption, so magnets fail loud rather than being attempted.
+    provider: "uc",
+    label: "UC网盘",
+    parseUid: parseCloudDriveUid,
+    isAuthError: isQuarkAuthError, // same error class — one family, one signal
+    resourceProviderKinds: ["pansou-uc"],
+    assumeChineseSubsFromChineseTitle: true,
+    authKind: "cookie",
+    provisionRootId: "0", // UC account root
+    writeScope: "parents", // family protocol: getFileInfo walks pdir_fid up
   },
   {
     provider: "guangya",
@@ -101,6 +126,7 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     authKind: "token",
     provisionRootId: "", // 光鸭 account root
     requiredCredentialKeys: ["accessToken", "refreshToken"],
+    writeScope: "listed",
   },
   {
     provider: "tianyi",
@@ -112,6 +138,7 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     authKind: "token",
     provisionRootId: "-11", // 天翼个人云 root folder id
     requiredCredentialKeys: ["sessionKey", "accessToken", "refreshToken"],
+    writeScope: "listed",
   },
   {
     provider: "pan123",
@@ -124,38 +151,74 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     authKind: "token",
     provisionRootId: "0", // 123 个人云根
     requiredCredentialKeys: ["token"],
+    writeScope: "listed",
   },
 ];
 
 /**
- * Map a brand's resource-provider kinds to the PanSou link types its acquisitions
- * may transfer. A 夸克 drive can only save 夸克 share links; 光鸭 / 123 / 115 take
- * their OWN share links plus magnets (光鸭: restore_share + offline download).
- * Pure + brand-table-driven so the resource assembly stays testable.
+ * Map a brand's (or multiple brands') resource-provider kinds to the PanSou /
+ * Haisou link types its acquisitions may transfer. A 夸克 drive can only save
+ * 夸克 share links; 光鸭 / 123 / 115 take their OWN share links plus magnets.
+ *
+ * In unified multi-drive mode, callers pass the UNION of `resourceProviderKinds`
+ * across all active connected drives (or call `allowedResourceTypesForProviders`),
+ * and this function returns the union of allowed `ResourceType`s without order bias.
  */
 export function allowedResourceTypesForKinds(kinds: readonly string[]): ResourceType[] {
+  if (kinds.length === 0) {
+    return ["115", "magnet"];
+  }
+  const out = new Set<ResourceType>();
+  if (kinds.includes("pansou-115")) {
+    out.add("115");
+    out.add("magnet");
+  }
   if (kinds.includes("pansou-quark")) {
-    return ["quark"];
+    out.add("quark");
+  }
+  if (kinds.includes("pansou-uc")) {
+    out.add("uc");
   }
   if (kinds.includes("pansou-tianyi")) {
-    return ["tianyi"];
+    out.add("tianyi");
   }
-  // 123 share + magnet when prowlarr/pansou-magnet is also listed (dual-path brand).
   if (kinds.includes("pansou-123")) {
-    return kinds.includes("prowlarr") || kinds.includes("pansou-magnet")
-      ? ["123", "magnet"]
-      : ["123"];
+    out.add("123");
   }
-  // 光鸭 share + magnet when a magnet source is also listed (dual-path brand).
   if (kinds.includes("pansou-guangya")) {
-    return kinds.includes("prowlarr") || kinds.includes("pansou-magnet")
-      ? ["guangya", "magnet"]
-      : ["guangya"];
+    out.add("guangya");
   }
-  if (kinds.includes("pansou-magnet")) {
-    return ["magnet"];
+  if (kinds.includes("pansou-magnet") || kinds.includes("prowlarr")) {
+    out.add("magnet");
   }
-  return ["115", "magnet"];
+  if (out.size === 0) {
+    return ["115", "magnet"];
+  }
+  return [...out];
+}
+
+/**
+ * Union of `ResourceProviderKind`s and `ResourceType`s across a list of connected
+ * storage providers (e.g. `["pan115", "quark", "pan123"]`). Falls back to `pan115`
+ * when no registered provider is given.
+ */
+export function allowedResourceTypesForProviders(providers: readonly string[]): {
+  kinds: ResourceProviderKind[];
+  allowedTypes: ResourceType[];
+} {
+  const registered = providers.filter(isRegisteredStorageProvider);
+  const effectiveProviders = registered.length > 0 ? registered : (["pan115"] as const);
+  const kindSet = new Set<ResourceProviderKind>();
+  for (const p of effectiveProviders) {
+    for (const k of getStorageBrand(p).resourceProviderKinds) {
+      kindSet.add(k);
+    }
+  }
+  const kinds = [...kindSet];
+  return {
+    kinds,
+    allowedTypes: allowedResourceTypesForKinds(kinds),
+  };
 }
 
 export function getStorageBrand(provider: string): StorageBrand {
@@ -170,6 +233,16 @@ export function getStorageBrand(provider: string): StorageBrand {
  *  `provider==="pan115"` filters to "any registered brand"). */
 export function isRegisteredStorageProvider(provider: string): provider is StorageProvider {
   return STORAGE_BRANDS.some((b) => b.provider === provider);
+}
+
+/** Whether the drive's executor writes only where it listed or created in this run
+ *  (see StorageBrand.writeScope). False for unknown or missing providers. */
+export function brandWritesOnlyListedDirectories(provider: string | undefined): boolean {
+  return (
+    provider !== undefined &&
+    isRegisteredStorageProvider(provider) &&
+    getStorageBrand(provider).writeScope === "listed"
+  );
 }
 
 /** Whether a brand can use Prowlarr (磁力/PT) — 115 yes, 夸克 no (no magnet API).

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildSandboxToolSet } from "../src/acquisition-v2/agent-loop.js";
 import { TaskSandbox } from "../src/acquisition-v2/sandbox.js";
 import { FakeResourceProviderV2 } from "../src/acquisition-v2/fake-provider.js";
@@ -57,13 +57,29 @@ describe("raw snapshot pre-warming", () => {
     // 预热:系统发起的 raw 搜索
     await sandbox.primeRawSnapshot("铁拳教育");
 
-    // viewResourceSnapshot 返回预搜候选的结构化文档
+    // viewResourceSnapshot 返回预搜候选的结构化文档（含 snapshotId，让 agent 直接传给 transferCandidate）
     const snapshot = sandbox.viewResourceSnapshot();
 
-    expect(snapshot.document).toBeTruthy();
+    expect(snapshot.snapshotId).toBeTruthy();
+    expect(snapshot.document).toContain(`snapshotId: ${snapshot.snapshotId}`);
     expect(snapshot.document).toContain("c0"); // 含 id
     expect(snapshot.document).toContain("铁拳教育 S01"); // 含 title
     expect(snapshot.candidateCount).toBe(3);
+  });
+
+  it("transferCandidate accepts either the returned snapshotId or a 'raw' / '活期文档' alias for a pre-warmed candidate", async () => {
+    const provider = new FakeResourceProviderV2({
+      results: { 咒术回战: [{ id: "jjk-s3", title: "咒术回战 第三季 全12集" }] },
+    });
+    const storage = new Storage115Simulator({
+      packs: { "jjk-s3": { files: [{ path: "S3 - 01.mkv", sizeBytes: 1 }] } },
+    });
+    const stagingDirectoryId = await storage.createDirectory({ name: "staging", parentId: "root" });
+    const sandbox = new TaskSandbox({ provider, storage, stagingDirectoryId, need: ["S01E48"] });
+
+    await sandbox.primeRawSnapshot("咒术回战");
+    const result = await sandbox.transferCandidate({ snapshotId: "raw", candidateId: "jjk-s3" });
+    expect(result.attempt.status).toBe("succeeded");
   });
 
   it("pre-warmed search does NOT consume the agent's distinct search budget", async () => {
@@ -599,5 +615,304 @@ describe("candidate post dates reach both agent read paths", () => {
     expect(again.snapshot!.candidates[1]).toMatchObject({ id: "s1-2", linkHistory: note });
     expect(again.snapshot!.candidates[0]!.linkHistory).toBe(again.snapshot!.candidates[1]!.linkHistory);
     expect(again.snapshot!.candidates[2]).not.toHaveProperty("linkHistory");
+  });
+});
+
+describe("预搜退避重试（源头自愈：双源全挂先等 5 秒重试一次）", () => {
+  /** 按调用次序作答的 provider——最后一次之后重复末位。带调用计数器。 */
+  function sequencedProvider(
+    stops: Array<{
+      health?: { status: "healthy" | "degraded" | "unreachable" | "protocol_error"; unhealthySources: string[] };
+      candidates?: Array<{ id: string; title: string }>;
+      throws?: boolean;
+    }>,
+  ) {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      async search(keyword: string) {
+        const stop = stops[Math.min(calls, stops.length - 1)]!;
+        calls += 1;
+        if (stop.throws) throw new Error("PROVIDER_ERROR: down");
+        return {
+          id: `s_${calls}`,
+          keyword,
+          candidates: stop.candidates ?? [],
+          ...(stop.health ? { sourceHealth: stop.health } : {}),
+        };
+      },
+    };
+  }
+
+  it("首搜不健康 → 等满 5 秒才重试一次，取到好结果", async () => {
+    // 生产实测源抖动多在 60 秒内自愈,5 秒退避窗口的救率高;这断言锁住
+    // 「真的等了 5 秒」和「只重试一次」,而不只是「多打了一次」。
+    vi.useFakeTimers();
+    try {
+      const provider = sequencedProvider([
+        { health: { status: "unreachable", unhealthySources: ["pansou"] } },
+        { health: { status: "healthy", unhealthySources: [] }, candidates: [{ id: "c1", title: "猛攻 4K" }] },
+      ]);
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.calls).toBe(1);
+      expect(vi.getTimerCount()).toBe(1); // 退避计时器已挂上
+
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(provider.calls).toBe(1); // 5 秒未到,不许提前重试
+
+      await vi.advanceTimersByTimeAsync(1);
+      await priming;
+      expect(provider.calls).toBe(2);
+      // 取到的是重试后的那份好结果。
+      expect(sandbox.viewResourceSnapshot().candidateCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("重试仍坏 → 落原样快照，只重试一次（不无限重试）", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = sequencedProvider([{ health: { status: "unreachable", unhealthySources: ["pansou"] } }]);
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await priming;
+
+      expect(provider.calls).toBe(2); // 首搜 + 恰好一次重试
+      expect(vi.getTimerCount()).toBe(0); // 没有第三个计时器 = 不在无限重试
+      expect(sandbox.viewResourceSnapshot().candidateCount).toBe(0); // 坏快照照落,预搜不抛
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("首搜抛错也退避重试一次，第二次成功即取到", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = sequencedProvider([
+        { throws: true },
+        { health: { status: "healthy", unhealthySources: [] }, candidates: [{ id: "c1", title: "猛攻" }] },
+      ]);
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await priming;
+
+      expect(provider.calls).toBe(2);
+      expect(sandbox.viewResourceSnapshot().candidateCount).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("健康的预搜一次到位，不退避（回归锁）", async () => {
+    const provider = sequencedProvider([
+      { health: { status: "healthy", unhealthySources: [] }, candidates: [{ id: "c1", title: "猛攻" }] },
+    ]);
+    const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+    await sandbox.primeRawSnapshot("猛攻");
+
+    expect(provider.calls).toBe(1);
+  });
+
+  it("degraded 首搜是可用证据 → 不重试（0 次），落 degraded 那份，不被更坏的重试结果换掉", async () => {
+    // degraded 是 fallback 救回的可用证据（有候选）。重试只为救「真的拿不到」，不为
+    // 救「次优」——重试结果可能更坏：第二次若给出双挂空快照，绝不许它覆盖 degraded
+    // 的候选（Copilot finding 的原形）。
+    const provider = sequencedProvider([
+      { health: { status: "degraded", unhealthySources: ["pansou"] }, candidates: [{ id: "c1", title: "猛攻 4K" }] },
+      { health: { status: "unreachable", unhealthySources: ["pansou", "prowlarr"] }, candidates: [] },
+    ]);
+    const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+    vi.useFakeTimers();
+    try {
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(provider.calls).toBe(1); // 0 次重试
+      expect(vi.getTimerCount()).toBe(0); // 连退避计时器都没挂
+
+      await vi.advanceTimersByTimeAsync(5000); // 无事发生
+      await priming;
+      expect(provider.calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+    // 落的是 degraded 那份（有候选），不是不可用空快照
+    expect(sandbox.viewResourceSnapshot().candidateCount).toBe(1);
+  });
+
+  it("首搜不可用 + 重试仍坏 → 落首搜那份（择优：重试可能更坏，不覆盖手里的证据）", async () => {
+    // 生产里不可用快照都是 0 候选，落谁都无从分辨；这里用带候选的不可用快照（类型合法）
+    // 让「落首搜那份」可断言——落点规则不许依赖「坏快照必然空」的巧合。
+    vi.useFakeTimers();
+    try {
+      const provider = sequencedProvider([
+        { health: { status: "unreachable", unhealthySources: ["pansou"] }, candidates: [{ id: "c1", title: "猛攻 4K" }] },
+        { health: { status: "unreachable", unhealthySources: ["pansou", "prowlarr"] }, candidates: [] },
+      ]);
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await priming;
+
+      expect(provider.calls).toBe(2); // 仍只重试恰好一次
+      expect(sandbox.viewResourceSnapshot().candidateCount).toBe(1); // 落首搜那份，不被更坏的重试换掉
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("首搜不可用 + 重试抛错 → 落首搜那份，预搜不抛（回归锁）", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = sequencedProvider([
+        { health: { status: "unreachable", unhealthySources: ["pansou"] }, candidates: [{ id: "c1", title: "猛攻 4K" }] },
+        { throws: true },
+      ]);
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await priming;
+
+      expect(provider.calls).toBe(2);
+      expect(sandbox.viewResourceSnapshot().candidateCount).toBe(1); // 落首搜那份，不是抛给调用方
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("两次都抛 → 抛第二次的错（回归锁，orchestrator 按「无预搜」降级）", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const provider = {
+        async search(): Promise<ResourceSnapshotV2> {
+          calls += 1;
+          throw new Error(calls === 1 ? "FIRST_BOOM" : "SECOND_BOOM");
+        },
+      };
+      const sandbox = new TaskSandbox({ provider, titleTerms: ["猛攻"] });
+
+      const priming = sandbox.primeRawSnapshot("猛攻");
+      // 处理器先挂上再推时钟：抛错发生在 advance 的中途，晚挂会先报 unhandled rejection。
+      const rejection = expect(priming).rejects.toThrow("SECOND_BOOM"); // 第二次的错，不是第一次的
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(5000);
+      await rejection;
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("multi-brand snapshot rendering in viewResourceSnapshot", () => {
+  it("renders · <品牌> only when multiple distinct brands are present in the snapshot", async () => {
+    const singleBrandProvider = new FakeResourceProviderV2({
+      results: {
+        单盘: [
+          { id: "c1", title: "琅琊榜 S01 4K", drive: "115", driveLabel: "115" },
+          { id: "c2", title: "琅琊榜 S01 1080p", drive: "115", driveLabel: "115" },
+        ],
+      },
+    });
+    const singleSandbox = new TaskSandbox({ provider: singleBrandProvider, need: ["S01E01"] });
+    await singleSandbox.primeRawSnapshot("单盘");
+    const singleDoc = singleSandbox.viewResourceSnapshot().document;
+    expect(singleDoc).toContain("[c1] 琅琊榜 S01 4K\n");
+    expect(singleDoc).not.toContain("· 115");
+
+    const multiBrandProvider = new FakeResourceProviderV2({
+      results: {
+        多盘: [
+          { id: "c1", title: "琅琊榜 S01 4K", drive: "115", driveLabel: "115", postedAt: "2026-10-01" },
+          { id: "c2", title: "琅琊榜 全54集", drive: "quark", driveLabel: "夸克" },
+          { id: "c3", title: "Nirvana.in.Fire.S01", drive: "magnet", driveLabel: "磁力" },
+        ],
+      },
+    });
+    const multiSandbox = new TaskSandbox({ provider: multiBrandProvider, need: ["S01E01"] });
+    await multiSandbox.primeRawSnapshot("多盘");
+    const multiDoc = multiSandbox.viewResourceSnapshot().document;
+    expect(multiDoc).toContain("[c1] 琅琊榜 S01 4K · 115 · 发布 2026-10-01\n");
+    expect(multiDoc).toContain("[c2] 琅琊榜 全54集 · 夸克\n");
+    expect(multiDoc).toContain("[c3] Nirvana.in.Fire.S01 · 磁力\n");
+  });
+
+  it("samples round-robin per brand (up to 60 per brand, 180 total) so 600 Quark rows never starve 200 115 rows (C7)", async () => {
+    const quarkRows = Array.from({ length: 600 }, (_, i) => ({
+      id: `q${i + 1}`,
+      title: `夸克候选 #${i + 1}`,
+      drive: "quark",
+      driveLabel: "夸克",
+    }));
+    const pan115Rows = Array.from({ length: 200 }, (_, i) => ({
+      id: `p${i + 1}`,
+      title: `115候选 #${i + 1}`,
+      drive: "115",
+      driveLabel: "115",
+    }));
+    const provider = new FakeResourceProviderV2({
+      results: {
+        三体: [...quarkRows, ...pan115Rows],
+      },
+    });
+    const sandbox = new TaskSandbox({ provider, need: ["S01E01"] });
+    await sandbox.primeRawSnapshot("三体");
+    const { document, candidateCount } = sandbox.viewResourceSnapshot();
+
+    expect(candidateCount).toBe(800);
+    // Both brands get 60 rows represented in the document (120 rows total for 2 brands).
+    expect(document).toContain("[q1] 夸克候选 #1 · 夸克\n");
+    expect(document).toContain("[q60] 夸克候选 #60 · 夸克\n");
+    expect(document).not.toContain("[q61]");
+    expect(document).toContain("[p1] 115候选 #1 · 115\n");
+    expect(document).toContain("[p60] 115候选 #60 · 115\n");
+    expect(document).not.toContain("[p61]");
+  });
+});
+
+describe("multi-brand snapshot pagination", () => {
+  it("retains per-drive first-page quotas and pages every remaining candidate exactly once", async () => {
+    const rows = ["quark", "115", "uc"].flatMap((drive) =>
+      Array.from({ length: 100 }, (_, i) => ({ id: `${drive}_${i}`, title: `Target ${drive} ${i}`, drive })),
+    );
+    const sandbox = new TaskSandbox({ provider: new FakeResourceProviderV2({ results: { Target: rows } }), need: ["S01E01"] });
+    await sandbox.primeRawSnapshot("Target");
+    const first = sandbox.viewResourceSnapshot();
+    const second = sandbox.viewResourceSnapshot({ offset: 180 });
+    expect(first.snapshotId).toBeTruthy();
+    expect(second.snapshotId).toBe(first.snapshotId);
+    for (const drive of ["quark", "115", "uc"]) {
+      expect(first.document).toContain(`[${drive}_59]`);
+      expect(first.document).not.toContain(`[${drive}_60]`);
+      expect(second.document).toContain(`[${drive}_60]`);
+    }
+    const ids = [...(first.document + second.document).matchAll(/^\[([^\]]+)\]/gm)].map((match) => match[1]);
+    expect(ids).toHaveLength(300);
+    expect(new Set(ids).size).toBe(300);
   });
 });

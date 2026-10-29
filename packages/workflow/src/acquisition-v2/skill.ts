@@ -16,6 +16,12 @@
  * so it ships reliably in the compiled package.
  */
 
+import { formatDriveSpaceSummary } from "../domain.js";
+import type { AcquisitionDriveContext } from "../ports.js";
+import { isRegisteredStorageProvider } from "../storage-brands.js";
+
+export type PromptDriveSummary = Pick<AcquisitionDriveContext, "storageId" | "provider" | "label" | "space">;
+
 const PROTOCOL = `# Method protocol (read this before you act)
 
 You drive your own observe → act → verify loop through the sandbox tools. "Intelligence" means: read the evidence the tools actually returned and decide in plain words — NOT acting on a hunch, and NOT firing many side effects before you have looked at what landed.
@@ -80,6 +86,36 @@ When a 夸克转存 fails with a SYSTEMIC message — "配额不足" / "额度�
 ## Black-box gate (same discipline as 115)
 "Transparent" = the title states size / resolution / episodes / release group. "Black-box / opaque" = a bare name or a vague bundle.
 - If a TRANSPARENT 夸克分享 clearly covers the need, select ONLY it and STOP. Do NOT also transfer opaque ones "just in case".
+- ONLY when ZERO transparent candidate covers may you fall back to a black-box one. When you do, your VERY NEXT step after it lands MUST be inspectStaging to VERIFY it actually holds the target — black-box coverage is UNPROVEN until you read the real files.
+  - Verified to cover → process it (move / dedup / mark) and finish. Do NOT keep searching for a "better" one.
+  - Does not cover → treat it as a dead candidate, clean its staging residue with deleteFiles, try the next.`;
+
+const DEAD_LINKS_BLACK_BOX_UC = `# Dead links, 转存, and black-box resources (UC网盘)
+
+> 提醒:raw 候选已预搜好,先 viewResourceSnapshot() 通读活期文档再动手;searchResources 只用于繁体/英文升级,别拿画质/字幕词搜。
+
+## How transfer works on THIS drive (UC)
+The drive is UC网盘 (drive.uc.cn). Every candidate is a UC分享链 (drive.uc.cn/s/<id>) — a 转存分享 (the 115-秒传 equivalent): the system exchanges the share token, lists the share, and saves its files into staging. This is the SAME protocol as 夸克. transferCandidate returns the TRUE materialized files (the system rereads for you). Trust THAT, not your prediction.
+
+## 无磁力 (this is the key difference from 115)
+UC has NO usable magnet / offline-download web API (its offline endpoint is gated behind a runtime-encrypted client payload). So there are NO magnet candidates here (the resource provider only surfaces UC分享链), and a magnet would fail LOUD ("UC_NO_MAGNET") if ever forced. There is therefore NO "magnet silently fails / wait for download" nuance at all — every candidate is an instant 转存分享 that either lands or fails loud.
+
+## 死链很多,这是常态 (important)
+UC shares on aggregators expire FAST — roughly HALF are already dead by the time you see them. Do NOT read a run of dead links as "this work has no resources". Every dead share is cheap to reject; keep walking the ranked list. A short bench of UC分享 for a popular title is NORMAL.
+
+## Fail-loud (a dead / expired / wrong share)
+A UC分享 fails LOUD with a clear reason — switch to another covering candidate:
+- "分享地址已失效" (code 41011), "好友已取消了分享" (code 41012), "分享不存在" (code 41027), "提取码错误 / 需要提取码". All = dead.
+A dead link is the NORM, never a reason to give up — try the next UC分享 that covers the need. For a movie, transferUntilLanded over your ranked UC分享 burns through the dead ones automatically (it relies on this loud failure, exactly like the 115 path).
+
+## SYSTEMIC BLOCK (别甩锅)
+When a UC转存 fails with a SYSTEMIC message — "配额不足" / "额度已用完" / "VIP会员" / "登录" / "鉴权" — the resource EXISTS but the ACCOUNT is blocked (quota / auth / VIP). The tool result carries \`systemicBlock: { reason: "..." }\`. **立即停 — DO NOT keep transferring.** Every candidate will fail the same way. Report honestly: the resource was found, the account cannot transfer it (not "no resource"). This is actionable (top up / re-login), never blame the resource.
+
+Separately, drive.uc.cn sometimes shows an account-risk banner ("账号涉嫌违规") in its own UI while transfers still succeed. Do NOT read that banner as a reason to stop, and do not put it in your report as a transfer failure — judge only by what transferCandidate actually returned.
+
+## Black-box gate (same discipline as 115)
+"Transparent" = the title states size / resolution / episodes / release group. "Black-box / opaque" = a bare name or a vague bundle.
+- If a TRANSPARENT UC分享 clearly covers the need, select ONLY it and STOP. Do NOT also transfer opaque ones "just in case".
 - ONLY when ZERO transparent candidate covers may you fall back to a black-box one. When you do, your VERY NEXT step after it lands MUST be inspectStaging to VERIFY it actually holds the target — black-box coverage is UNPROVEN until you read the real files.
   - Verified to cover → process it (move / dedup / mark) and finish. Do NOT keep searching for a "better" one.
   - Does not cover → treat it as a dead candidate, clean its staging residue with deleteFiles, try the next.`;
@@ -207,7 +243,7 @@ Reject packs / collections / box sets / multi-part / anything structured like se
   - The SET is YOUR semantic choice. A keyword search is a WILDCARD — it mixes in same-named DIFFERENT works (e.g. under "抓娃娃" the movie sits among a 综艺/variety show "姐姐妹妹抓娃娃" and even an unrelated cartoon). NEVER hand it the raw result list — first read every title and include ONLY the ones that are genuinely this film+year. Handing it everything = transferring a wrong work.
 
 ## The collapsed loop
-search (re-keyword if weak) → decide the ONE correct film and RANK its candidate links (Evidence → Facts → Decision) → transfer it (transferUntilLanded over your ranked shares, or transferCandidate for one share / a magnet) → inspectStaging to read the TRUE files → flattenMovie() AUTOMATICALLY pulls the film AND its subtitles up into the movie directory and removes the wrapper (one call, no per-file selection — a movie is one film, take it all; subtitles MUST land beside the video so the scraper finds them; the wrapper's covers/poster/nfo are discarded with it) → delete any extras (trailers / 花絮 / a bundled different work) with deleteFiles → markObtained(["MOVIE"]) as the LAST step, once the film is in place → finish().
+search (re-keyword if weak) → decide the ONE correct film and RANK its candidate links (Evidence → Facts → Decision) → transfer it (transferUntilLanded over your ranked shares, or transferCandidate for one share / a magnet) → inspectStaging to read the TRUE files → flattenMovie() AUTOMATICALLY pulls the film AND its subtitles up into the movie directory and removes the wrapper (one call, no per-file selection — subtitles MUST land beside the video so the scraper finds them; the wrapper's covers/poster/nfo are discarded with it) → delete any extras (trailers / 花絮 / a bundled different work) AND any redundant quality/resolution encodes of the same film (when a share folder bundles e.g. 1080p + 4K WEB-DL + 4K REMUX together, keep ONLY the single video file best matching the user's quality preference and its subtitles) with deleteFiles → markObtained(["MOVIE"]) as the LAST step, once the single chosen film is in place → finish().
 
 ## Worked example — 奥本海默 (the live failure to NOT repeat)
 Searching "奥本海默" returns mixed links: a few 115 shares (some 链接已过期 / 分享已取消) and several magnets (some malformed → 错误的链接), most with OPAQUE black-box titles, ~4 dead and 1 good.
@@ -226,6 +262,13 @@ You own one OR MORE seasons in scope. The need is "应有 vs 实有 = which epis
 - Season 1 (most Chinese dramas default here): a title without explicit season markers may match — focus on episode coverage ("庆余年 全集", "更新至46集").
 - Season 2+ (US/Korean/Japanese dramas): the title MUST explicitly indicate the tracked season. "完结" / "更新至13集" with no season info is probably Season 1 → skip. Only "第二季 ...", "S02E...", "Season 2" count for season 2.
 - Worked example — The Pitt (匹兹堡医护前线), tracking Season 2, missing S02E04: "匹兹堡医护前线 完结" (no season → likely S1 → skip); "更新至13集" (no season → skip); "第二季 更新至03集" (S2 but only E01-E03 → does not cover E04 → skip); "第二季 1-6集合集" (S2, covers E04 → TRANSFER).
+
+## Officially-unsegmented shows — fan seasons are NOT a mismatch
+Some rights holders never numbered seasons, so the metadata database stores ONE absolute run while every release group, subtitle team and viewer counts 第二季 / 第三季 / a story-arc name as its own block. 咒术回战 is the canonical case: fan 第二季 (怀玉·玉折／涩谷事变) = absolute E25-E47, 死灭回游 = E48-E59. 药屋少女的呢喃: fan 第二季 = E25-E48, 第三季 = E49-E60.
+- A resource titled "第二季" / "死灭回游" / "怀玉·玉折" for such a show is the SAME work with shifted numbering — it is NOT another season to skip and NOT a wrong match.
+- Map it onto the absolute episodes this task tracks: if you are unsure of the range, call researchTitle once with a concrete question ("<作品> 第二季 对应 第几集到第几集") and use the answer. The web answer is reference only — it never becomes a candidate and never changes what the task says the show is.
+- Then transfer the covering resource, read the real files yourself, and file them under the SEASON THIS TASK TRACKS. The library key stays the metadata database's; the fan name is a search/matching hint only.
+- NEVER report no-coverage (or "wrong season") because of a season-name mismatch you did not check — that silently leaves a real gap (the reported 药屋少女/咒术回战 bug).
 
 ## Coverage with the FEWEST reliable transfers (and BATCH the decided set)
 - If ONE complete / full-season pack covers the whole need, transfer just it and stop searching.
@@ -354,6 +397,9 @@ export function getStorageSkill(provider: string): string {
   if (provider === "quark") {
     return DEAD_LINKS_BLACK_BOX_QUARK;
   }
+  if (provider === "uc") {
+    return DEAD_LINKS_BLACK_BOX_UC;
+  }
   if (provider === "guangya") {
     return DEAD_LINKS_BLACK_BOX_GUANGYA;
   }
@@ -369,16 +415,79 @@ export function getStorageSkill(provider: string): string {
   throw new Error(`unknown storage brand: ${provider}`);
 }
 
+/**
+ * Build the multi-drive allocation section (`## 你手上有这几块盘`) when >1 active
+ * drive is available. Enforces the 7 hard rules:
+ *  1. Over-quota / full drives (`remainingBytes <= 0`) are strictly forbidden.
+ *  2. Single-drive completion is the default — never split if one drive can cover all missing episodes.
+ *  3. Split across drives ONLY when splitting increases total obtained episode count.
+ *  4. Share links are brand-locked (Quark share -> Quark drive, 115 share -> 115 drive).
+ *  5. Never split just to balance free space.
+ *  6. Never store duplicate copies of the same episode across multiple drives.
+ *  7. When an episode's only candidate is on an over-quota drive, report honestly that the drive is out of space rather than "no resource".
+ */
+export function buildMultiDriveAllocationBlock(
+  drives: readonly PromptDriveSummary[],
+  primaryStorageId?: string | null,
+): string {
+  if (drives.length <= 1) {
+    return "";
+  }
+  const lines = drives.map((d, idx) => {
+    const summary = formatDriveSpaceSummary(d.space);
+    const homeTag = primaryStorageId && d.storageId === primaryStorageId ? " · 【本剧历史在追主盘】" : "";
+    return `${idx + 1}. ${d.label} [storageId=${d.storageId}, provider=${d.provider}] — ${summary.agentText}${homeTag}`;
+  });
+  return `## 你手上有这几块盘（多盘统一获取规则 — 必读）
+
+当前已连接的可用网盘：
+${lines.join("\n")}
+
+候选列表里每条资源都带有品牌/通道标签（如 \`· 115\`、\`· 夸克\`、\`· 123\`、\`· 磁力\`）。你必须严格遵守以下 7 条铁律：
+
+1. **剩余空间 <= 0（已超配额/已满）的网盘严禁落盘**：余量数据的唯一作用就是排除装不下的盘。上面标注「禁止写入」的超额网盘（以及剩余空间小于候选已知体积的网盘），不论候选画质多好、不论是不是唯一有源的盘，**一律不得转存**（沙箱在入口也会直接硬拦截 \`SANDBOX_DRIVE_OUT_OF_SPACE\`）。
+2. **默认一块盘收齐（单盘优先，绝不无故拆盘）**：先看有没有**任何单块可用盘**能覆盖全部缺集。如果有，就只用那一块盘收齐，其余网盘一律不碰！选哪块盘：先排除剩余空间 <= 0 的盘，在能收齐的单盘里按资源画质与中字完整性挑最好的（画质相同时优先【本剧历史在追主盘】或排在前面的盘）。
+3. **拆盘的唯一标准：拆完能拿到的总集数 > 单盘能拿到的集数**：只有当没有任何单块可用盘能覆盖全部缺集时（例如 E01–E13 只有 115 有源、E14–E24 只有 123 有源，单盘只能拿 13 集、两盘合起来能拿 24 集），才允许把缺集拆分到多块盘；而且能用两块盘搞定就绝不摊到三块。
+4. **分享链品牌锁定，不能跨品牌转存**：夸克分享链只能转进夸克盘，115 分享链只能转进 115 盘，123/天翼/UC/光鸭同理；磁力链可转进支持磁力的可用盘（115 / 光鸭 / 123）。同品牌如果绑了多块盘，系统会自动路由到空间足够的盘（你也可在 \`transferCandidate\` 传 \`storageId\` 指定）。
+5. **严禁为了「均衡剩余空间」而拆盘**：余量只用来排除装不下的盘，绝不用来分摊集数。只要一块盘还装得下，就不要因为别的盘更空而把剧集拆散。
+6. **同一集绝不在两块盘各存一份**：那是重复浪费，不是分配。每一集只落一块盘。
+7. **在更剧与超额盘诚实上报**：
+   - 在更剧如果标注了【本剧历史在追主盘】且该盘空间足够、有源，优先继续落在该主盘，不要另开新盘；只有主盘确实没有某集或已满、而其他可用盘有源时，才用其他盘补齐缺集。
+   - 如果某集的候选**只存在于已超配额/空间不足的网盘**上，结果是拿不到该集——此时必须留缺或 \`reportNoCoverage\`，并在原因里**如实写明是「对应网盘空间已满/超额（如夸克已超配额）」**，绝不能谎报成「暂未找到可用资源」！`;
+}
+
 /** Read one section of the skill manual on demand, for the run's drive brand
- *  (defaults to 115). The "dead-links-black-box" section is brand-specific; the
- *  rest are shared. Unknown name → a clear error string the agent can recover from. */
-export function readSkillSection(section: string, provider: string = "pan115"): string {
+ *  (defaults to 115). The "dead-links-black-box" section is brand-specific; when
+ *  `drives` has >1 active drive, `dead-links-black-box` and `protocol` include the
+ *  multi-drive allocation rules and the combined brand manuals. */
+export function readSkillSection(
+  section: string,
+  provider: string = "pan115",
+  drives?: readonly PromptDriveSummary[],
+  primaryStorageId?: string | null,
+): string {
+  const multiBlock = drives && drives.length > 1 ? buildMultiDriveAllocationBlock(drives, primaryStorageId) : "";
   if (section === "dead-links-black-box") {
+    if (drives && drives.length > 1) {
+      const seenProviders = new Set<string>();
+      const brandManuals: string[] = [];
+      for (const d of drives) {
+        if (seenProviders.has(d.provider) || !isRegisteredStorageProvider(d.provider)) continue;
+        seenProviders.add(d.provider);
+        brandManuals.push(getStorageSkill(d.provider));
+      }
+      if (brandManuals.length > 0) {
+        return `${multiBlock}\n\n${brandManuals.join("\n\n---\n\n")}`;
+      }
+    }
     return getStorageSkill(provider);
   }
   const body = (SECTIONS as Record<string, string>)[section];
   if (body === undefined) {
     return `Unknown skill section "${section}". Available sections: ${SKILL_SECTION_NAMES.join(", ")}.`;
+  }
+  if (section === "protocol" && multiBlock) {
+    return `${multiBlock}\n\n${body}`;
   }
   return body;
 }

@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { LanguageModel } from "ai";
 import { isAgentMemoryEnabled } from "./agent-memory-server";
 import { cache } from "react";
 import { generateText } from "ai";
@@ -15,6 +16,7 @@ import {
   createBootstrapPan115CookieStorageExecutor,
   CompositeResourceProvider,
   ProwlarrResourceProvider,
+  HaisouResourceProvider,
   createJevJudge,
   DEFAULT_JEV_BASE_URL,
   type JevJudge,
@@ -28,6 +30,9 @@ import {
   createAgentModel,
   createAgentModelFromEnv,
   createStubAcquisitionModel,
+  FREE_LLM_PRESET,
+  isFreeLlmPreset,
+  isBlankEnvValue,
   llmConfigError,
   formatDailyDigestPushText,
   scheduledDigestItems,
@@ -61,11 +66,15 @@ import {
   getStorageBrand,
   isRegisteredStorageProvider,
   allowedResourceTypesForKinds,
-  parseQuarkUid,
+  allowedResourceTypesForProviders,
+  parseCloudDriveUid,
   parseTianyiUid,
+  UC_PROFILE,
   parsePan123Uid,
   generateGuangYaDeviceId,
   GuangYaClient,
+  isRunOrItsSeasonRecord,
+  type QueueClaimOptions,
   type ResolveAccountWorkerContext,
   hashPassword,
   verifyPassword,
@@ -78,6 +87,12 @@ import {
   pickWorkspaceStorageId,
   resolveQueueStorageChoice,
   resolveWorkspaceFromParam,
+  DRIVE_ORDER_SETTING_KEY,
+  DRIVE_SPACE_CACHE_TTL_MS,
+  sortDrivesByOrder,
+  type AcquisitionDriveContext,
+  type DriveSpaceCacheEntry,
+  type DriveSpaceInfo,
   type Account,
   type WorkflowScope,
   type MediaSearchCandidate,
@@ -106,6 +121,18 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
+import { DEFAULT_AUTO_UPDATE_TIME, isAutoUpdateTime, shouldAutoUpdate } from "./auto-update-schedule";
+
+/** Checked by the workflow package right before each claim or patrol reservation, not
+ *  only at entry: the updater can take the hold while a tick is still setting up. */
+const mayStartRun = () => !isUpdateHoldActive(Date.now());
+
+/** True while the updater holds new work before a container swap. Lets server actions
+ *  (e.g. importForeignWorkAction) refuse upfront without importing update-hold directly. */
+export function isUpdateInProgress(): boolean {
+  return isUpdateHoldActive(Date.now());
+}
 
 export type CandidateTrackingRequestResult =
   | {
@@ -490,6 +517,16 @@ export class UnauthenticatedAccountError extends Error {
   }
 }
 
+/** Thrown when a drive mutation is refused because an update is about to swap the web
+ *  container. Rechecked INSIDE the in-flight guard so the updater's busy check cannot miss
+ *  it: the caller turns it into a "try again after the update" message. */
+export class UpdateInProgressError extends Error {
+  constructor(message = "正在更新，更新完成后再试。") {
+    super(message);
+    this.name = "UpdateInProgressError";
+  }
+}
+
 let sessionSecretCache: string | null = null;
 
 /** The HMAC secret for session cookies: env override, else a generated value
@@ -584,17 +621,29 @@ export function getAccountScopedSettings(
  */
 export async function getActiveWorkspaceScope(storageId?: string): Promise<WorkflowScope> {
   const accountId = await getCurrentAccountId();
+  if (storageId === undefined) {
+    return { accountId, connectedStorageId: null };
+  }
   const storages = await getWorkflowRepository().listConnectedStorages(accountId);
   const connectedStorageId = pickWorkspaceStorageId(
-    // Tree model: a workspace is any registered brand's drive (115 or quark), not
-    // just 115 — so a quark drive shows up as its own switchable workspace.
     storages.filter((storage) => isRegisteredStorageProvider(storage.provider)),
     storageId,
   );
   return { accountId, connectedStorageId };
 }
 
-/** 通知页/角标只展示最近 N 天 —— 旧通知不再无限堆积。 */
+/** Books retain their explicit destination even on the unified root page. */
+export async function getBookWorkspaceScope(storageId?: string): Promise<WorkflowScope> {
+  const scope = await getActiveWorkspaceScope(storageId);
+  if (storageId !== undefined) return scope;
+  const storages = await getWorkflowRepository().listConnectedStorages(scope.accountId);
+  return {
+    ...scope,
+    connectedStorageId: pickWorkspaceStorageId(storages.filter((storage) => isRegisteredStorageProvider(storage.provider)), undefined),
+  };
+}
+
+/** 通知页/角标只展示最近 N 天 —— 旧通知不再堆积。 */
 export const NOTIFICATION_WINDOW_DAYS = 7;
 
 /** ISO cutoff for the notification window (now − NOTIFICATION_WINDOW_DAYS). */
@@ -611,14 +660,53 @@ export async function untrackTrackedTitle(
   seasonNumber?: number,
 ): Promise<{ status: "untracked" | "not_found" | "in_flight"; removedSeasons: number }> {
   const scope = await getActiveWorkspaceScope(storageId);
-  return getWorkflowRepository().untrackTitle(tmdbId, scope, mediaKind, seasonNumber);
+  const repo = getWorkflowRepository();
+  if (scope.connectedStorageId !== null) {
+    return repo.untrackTitle(tmdbId, scope, mediaKind, seasonNumber);
+  }
+  const states = (await repo.listTrackedSeasonStates(scope)).filter(
+    (state) =>
+      state.title.tmdbId === tmdbId &&
+      (state.title.type === "movie") === (mediaKind === "movie") &&
+      (seasonNumber === undefined || state.season.seasonNumber === seasonNumber),
+  );
+  if (states.length === 0) {
+    return { status: "not_found", removedSeasons: 0 };
+  }
+  const targetSeasonIds = new Set(states.map((s) => s.season.id));
+  const activeRuns = await repo.listActiveWorkflowRuns(scope);
+  const hasActiveRun = activeRuns.some(
+    (snap) =>
+      snap.title.tmdbId === tmdbId &&
+      (snap.title.type === "movie") === (mediaKind === "movie") &&
+      ((snap.workflowRun.status === "running" && snap.workflowRun.kind !== "staging_recovery" && targetSeasonIds.has(snap.season.id)) ||
+        snap.workflowRun.kind === "replace_request"),
+  );
+  if (hasActiveRun) {
+    return { status: "in_flight", removedSeasons: 0 };
+  }
+  const storageIds = [...new Set(states.map((s) => s.connectedStorageId))];
+  let removedSeasons = 0;
+  for (const sid of storageIds) {
+    const res = await repo.untrackTitle(
+      tmdbId,
+      { accountId: scope.accountId, connectedStorageId: sid },
+      mediaKind,
+      seasonNumber,
+    );
+    if (res.status === "in_flight") {
+      return res;
+    }
+    if (res.status === "untracked") {
+      removedSeasons += res.removedSeasons;
+    }
+  }
+  return { status: removedSeasons > 0 ? "untracked" : "not_found", removedSeasons };
 }
 
 /** Resolve a global page's (通知/活动/设置) active workspace from its `?w` param.
- *  Returns the scope to filter content by, the basePath for the sidebar's
- *  library/search links, and the activeStorageId for the sidebar's global links
- *  (undefined = primary → those links stay `?w`-free). A stale `w` falls back to
- *  primary (never 404). */
+ *  When `w` is omitted, returns the unified cross-drive scope (`connectedStorageId: null`)
+ *  so notifications and activity show all drives of the account. */
 export async function resolveGlobalWorkspace(w: string | undefined): Promise<{
   accountId: string;
   connectedStorageId: string | null;
@@ -626,6 +714,9 @@ export async function resolveGlobalWorkspace(w: string | undefined): Promise<{
   activeStorageId: string | undefined;
 }> {
   const accountId = await getCurrentAccountId();
+  if (!w) {
+    return { accountId, connectedStorageId: null, basePath: "/", activeStorageId: undefined };
+  }
   const storages = (await getWorkflowRepository().listConnectedStorages(accountId)).filter((storage) =>
     isRegisteredStorageProvider(storage.provider),
   );
@@ -809,7 +900,7 @@ export async function queueCandidateTracking(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   const movieTmdbId = parseMovieCandidateId(candidateId);
   if (movieTmdbId !== null) {
@@ -869,10 +960,11 @@ export async function recoverOrphanedRuns(): Promise<number> {
   return (await repository.requeueRunningWorkflowRuns()) + (await repository.recoverRunningBookEntries());
 }
 
-async function runNextQueuedBook(): Promise<{ status: "idle" | "succeeded" | "failed" }> {
+async function runNextQueuedBook(claim?: QueueClaimOptions): Promise<{ status: "idle" | "succeeded" | "failed" }> {
   const repository = getWorkflowRepository();
-  const entry = await repository.claimNextQueuedBookEntry();
+  const entry = await repository.claimNextQueuedBookEntry(claim);
   if (!entry) return { status: "idle" };
+  claim?.onClaimed?.({ workflowRunId: `book:${entry.book.id}`, connectedStorageId: entry.connectedStorageId });
   const scope = { accountId: entry.accountId, connectedStorageId: entry.connectedStorageId };
   const { getBookMetadata, searchBooks } = await import("./book-metadata");
   const { searchBookLinks } = await import("./book-search");
@@ -915,10 +1007,11 @@ async function runNextQueuedBook(): Promise<{ status: "idle" | "succeeded" | "fa
   return { status: "failed" };
 }
 
-async function checkNextPendingBook(): Promise<{ status: "idle" | "succeeded" | "failed" }> {
+async function checkNextPendingBook(claim?: QueueClaimOptions): Promise<{ status: "idle" | "succeeded" | "failed" }> {
   const repository = getWorkflowRepository();
-  const entry = await repository.claimNextPendingBookEntry(new Date(Date.now() - 30_000).toISOString());
+  const entry = await repository.claimNextPendingBookEntry(new Date(Date.now() - 30_000).toISOString(), claim);
   if (!entry) return { status: "idle" };
+  claim?.onClaimed?.({ workflowRunId: `book:${entry.book.id}`, connectedStorageId: entry.connectedStorageId });
   const scope = { accountId: entry.accountId, connectedStorageId: entry.connectedStorageId };
   try {
     const executor = await getWorkerStorageExecutor(entry.accountId, entry.connectedStorageId);
@@ -986,12 +1079,15 @@ export function buildAccountContextResolver(): ResolveAccountWorkerContext {
     // specific drive it was queued onto.
     const scoped = getAccountScopedSettings(accountId);
     const parents = await getWorkerStorageParents(accountId, connectedStorageId);
-    const { model, preferredLanguage, qualityPreference } = await getAgentModel(scoped);
+    const { model, llmConfig, preferredLanguage, qualityPreference } = await getAgentModel(scoped);
     // The run's drive brand selects its resource sources (quark→PanSou quark-only;
     // 115→PanSou+Prowlarr). null when no drive resolves → default 115 fallback.
     const driveProvider =
       (await getAccountStorageCredentials(accountId, connectedStorageId))?.provider ?? "pan115";
     const assrtToken = await getAssrtToken(scoped);
+    // Web reference (alternate titles, fan-season ↔ episode mapping) follows THIS
+    // account's LLM endpoint — DeepSeek's search when that is what they configured.
+    const titleResearch = await resolveTitleResearchOptions(scoped);
     // Per-account: undefined unless THIS account set a key, enabled the prefilter
     // and the save-time probe passed. Undefined → the orchestrator keeps the bare
     // provider, so an unconfigured account costs exactly zero Jev calls.
@@ -1003,12 +1099,20 @@ export function buildAccountContextResolver(): ResolveAccountWorkerContext {
       console.log(`[memory] agent_memory_enabled read failed (defaulting on): ${error instanceof Error ? error.message : String(error)}`);
       return true;
     });
+    const drives = await resolveAccountActiveDrives(accountId);
+    const activeProviders =
+      drives.length > 0 ? drives.map((d) => d.provider) : [driveProvider];
     return {
       storage: await getWorkerStorageExecutor(accountId, connectedStorageId),
-      resourceProvider: await getWorkerResourceProvider(scoped, driveProvider, accountId),
+      resourceProvider: await getWorkerResourceProvider(scoped, activeProviders, accountId),
       storageProvider: driveProvider,
       model,
+      // The worker uses this ONLY to pick the free-preset failure copy for THIS
+      // account's acquisitions (isFreeLlmPreset) — multi-user accounts each get
+      // their own Kilo/BYO verdict.
+      llmConfig,
       ...(assrtToken === undefined ? {} : { assrtToken }),
+      titleResearch,
       ...(jevJudge === undefined ? {} : { jevJudge }),
       agentMemory,
       ...(preferredLanguage === undefined ? {} : { preferredLanguage }),
@@ -1016,8 +1120,102 @@ export function buildAccountContextResolver(): ResolveAccountWorkerContext {
       storageParentDirectoryId: parents.tv,
       animeStorageParentDirectoryId: parents.anime,
       moviesParentDirectoryId: parents.movies,
+      ...(drives.length > 0 ? { drives } : {}),
     };
   };
+}
+
+/** Read the account's user-configured drive priority order (`drive_order` setting). */
+export async function getAccountDriveOrder(
+  accountId: string,
+  repository: Pick<WorkflowRepository, "getAccountSetting"> = getWorkflowRepository(),
+): Promise<string[]> {
+  try {
+    const raw = await repository.getAccountSetting(accountId, DRIVE_ORDER_SETTING_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((id): id is string => typeof id === "string" && id.trim() !== "");
+  } catch {
+    return [];
+  }
+}
+
+/** Persist the account's user-configured drive priority order (`drive_order` setting). */
+export async function setAccountDriveOrder(
+  accountId: string,
+  driveIds: readonly string[],
+  repository: Pick<WorkflowRepository, "setAccountSetting"> = getWorkflowRepository(),
+): Promise<void> {
+  const unique = [...new Set(driveIds.map((id) => id.trim()).filter(Boolean))];
+  await repository.setAccountSetting(accountId, DRIVE_ORDER_SETTING_KEY, JSON.stringify(unique));
+}
+
+/**
+ * Resolve all active, registered drives for `accountId` in the user's configured
+ * priority order (`drive_order`, falling back to `created_at`). Each entry carries
+ * its own StorageExecutor, its own provisioned category parents (`tv`, `anime`,
+ * `movies`), and its cached space info.
+ *
+ * ⚠️ Unlike `getWorkerStorageParents`, non-115 drives NEVER fall back to the
+ * global 115 env CIDs (`TV_SHOWS_CID`, etc.); a drive whose category CIDs are
+ * missing and cannot be self-healed is skipped rather than given another drive's CIDs.
+ */
+export async function resolveAccountActiveDrives(
+  accountId: string = DEFAULT_ACCOUNT_ID,
+): Promise<AcquisitionDriveContext[]> {
+  const adapter = process.env.MEDIA_TRACK_STORAGE_ADAPTER ?? "fake";
+  if (adapter !== "115") {
+    return [];
+  }
+  try {
+    const repo = getWorkflowRepository();
+    const rows = (await repo.listConnectedStorages(accountId)).filter(
+      (row) => row.status === "active" && isRegisteredStorageProvider(row.provider),
+    );
+    if (rows.length === 0) {
+      return [];
+    }
+    const order = await getAccountDriveOrder(accountId, repo);
+    const sorted = sortDrivesByOrder(rows, order);
+    const resolved = await Promise.all(
+      sorted.map(async (row): Promise<AcquisitionDriveContext | null> => {
+        try {
+          const creds = await getAccountStorageCredentials(accountId, row.id);
+          if (!creds || creds.status !== "active") {
+            return null;
+          }
+          const is115 = creds.provider === "pan115";
+          const tv = creds.tvCid || (is115 ? storageParentDirectoryId() : "");
+          const anime = creds.animeCid || creds.tvCid || (is115 ? animeParentDirectoryId() : "");
+          const movies = creds.moviesCid || (is115 ? moviesParentDirectoryId() : "");
+          if (!tv || !anime || !movies) {
+            return null;
+          }
+          const [storage, space] = await Promise.all([
+            getWorkerStorageExecutor(accountId, row.id),
+            resolveCachedDriveSpace(accountId, row.id, "active"),
+          ]);
+          const brandLabel = getStorageBrand(creds.provider).label;
+          return {
+            storageId: row.id,
+            provider: creds.provider,
+            label: row.label?.trim() ? `${brandLabel}（${row.label.trim()}）` : brandLabel,
+            storage,
+            parents: { tv, anime, movies },
+            space,
+          };
+        } catch (error) {
+          console.warn(`[multi-drive] skipping drive ${row.id} for ${accountId}: ${String(error)}`);
+          return null;
+        }
+      }),
+    );
+    return resolved.filter((ctx): ctx is AcquisitionDriveContext => ctx !== null);
+  } catch (error) {
+    console.warn(`[multi-drive] failed to resolve active drives for ${accountId}: ${String(error)}`);
+    return [];
+  }
 }
 
 /** 记录自建搜索源的最新健康结论,供设置页徽章读取(它每 8s 轮询,不能自己打网络)。
@@ -1053,11 +1251,24 @@ export function __resetPanSouHealthCacheForTests(): void {
   lastRecordedPanSouHealth.clear();
 }
 
-export async function runNextQueuedWorkflow() {
+/** Claim and run the next queued run. The in-process worker passes `claim` (its drive
+ *  filter and claim callback) so several runs can go at once, never two on one drive;
+ *  without it the oldest claimable run is taken, as before. */
+export async function runNextQueuedWorkflow(claim?: QueueClaimOptions) {
+  // An update is about to replace this process: start nothing new. Queued runs stay
+  // queued and run on the new version.
+  if (isUpdateHoldActive(Date.now())) {
+    return { status: "idle" as const };
+  }
+  // In flight for the updater's busy check, from here to the claim it guards.
+  return whileInFlight(() => runNextQueuedWorkflowNow(claim));
+}
+
+async function runNextQueuedWorkflowNow(claim: QueueClaimOptions | undefined) {
   const repository = getWorkflowRepository();
-  const book = await runNextQueuedBook();
+  const book = await runNextQueuedBook(claim);
   if (book.status !== "idle") return book;
-  const pendingBook = await checkNextPendingBook();
+  const pendingBook = await checkNextPendingBook(claim);
   if (pendingBook.status !== "idle") return pendingBook;
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -1068,7 +1279,7 @@ export async function runNextQueuedWorkflow() {
   // The user's language preference is standing context baked into the agent
   // instance (one global preference), so every workflow — movie, series, type2,
   // anime — searches with it. No per-workflow plumbing.
-  const { model, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
+  const { model, llmConfig, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
   const language = preferredLanguage === undefined ? {} : { preferredLanguage };
   const quality = qualityPreference === undefined ? {} : { qualityPreference };
   const storage = await getWorkerStorageExecutor(accountId);
@@ -1076,6 +1287,7 @@ export async function runNextQueuedWorkflow() {
   const resolveAccountContext = buildAccountContextResolver();
   const startedAt = new Date().toISOString();
   const onAuthErrorFreeze = (id: string, reason: string) => freezeConnectedStorage(id, reason);
+  const claimOption = claim === undefined ? {} : { claim };
   // Urgent user messages ("现在处理", written mid-run, or retry after a failure) get a
   // replace_request as soon as the queue is free — never waiting for the patrol.
   try {
@@ -1088,15 +1300,21 @@ export async function runNextQueuedWorkflow() {
     resourceProvider: await getWorkerResourceProvider(),
     storage,
     model,
+    // Free-tier failure copy (Task 5): lets the worker's failure handler run
+    // isFreeLlmPreset on the BASE model config; per-account runs override via
+    // resolveAccountContext's llmConfig.
+    llmConfig,
     ...language,
     ...quality,
     storageParentDirectoryId: parents.tv,
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (type2.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: type2.workflowRunId });
     return type2;
   }
   const series = await runQueuedSeriesInitialization({
@@ -1104,15 +1322,21 @@ export async function runNextQueuedWorkflow() {
     resourceProvider: await getWorkerResourceProvider(),
     storage,
     model,
+    // Free-tier failure copy (Task 5): lets the worker's failure handler run
+    // isFreeLlmPreset on the BASE model config; per-account runs override via
+    // resolveAccountContext's llmConfig.
+    llmConfig,
     ...language,
     ...quality,
     storageParentDirectoryId: parents.tv,
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (series.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: series.workflowRunId });
     return series;
   }
   const movie = await runQueuedMovieAcquisition({
@@ -1120,14 +1344,20 @@ export async function runNextQueuedWorkflow() {
     resourceProvider: await getWorkerResourceProvider(),
     storage,
     model,
+    // Free-tier failure copy (Task 5): lets the worker's failure handler run
+    // isFreeLlmPreset on the BASE model config; per-account runs override via
+    // resolveAccountContext's llmConfig.
+    llmConfig,
     ...language,
     ...quality,
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (movie.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: movie.workflowRunId });
     return movie;
   }
   const replace = await runQueuedReplaceRequest({
@@ -1135,6 +1365,10 @@ export async function runNextQueuedWorkflow() {
     resourceProvider: await getWorkerResourceProvider(),
     storage,
     model,
+    // Free-tier failure copy (Task 5): lets the worker's failure handler run
+    // isFreeLlmPreset on the BASE model config; per-account runs override via
+    // resolveAccountContext's llmConfig.
+    llmConfig,
     ...language,
     ...quality,
     storageParentDirectoryId: parents.tv,
@@ -1142,23 +1376,30 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
     // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
     ...syncOption(),
   });
   if (replace.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: replace.workflowRunId });
     return replace;
   }
-  // Leftover staging heals itself. No notification and no push.
+  // Leftover staging heals itself. No notification and no push — llmConfig is
+  // still passed so a free-preset 429/5xx transient error triggers auto-requeue
+  // instead of terminally failing the recovery run.
   return runQueuedStagingRecovery({
     repository,
     resourceProvider: await getWorkerResourceProvider(),
     storage,
     model,
+    llmConfig,
     ...language,
     ...quality,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
 }
 
@@ -1211,6 +1452,49 @@ export async function getLlmConfig(repository: {
     baseURL: await read(LLM_BASE_URL_SETTING_KEY),
     apiKey: await read(LLM_API_KEY_SETTING_KEY),
     modelId: await read(LLM_MODEL_ID_SETTING_KEY),
+  };
+}
+
+/**
+ * The model the SEARCH BOX uses to interpret a description. It is the account's
+ * own configured model (Settings → AI 模型), and consciously NOT the shipped
+ * free preset: the free pool is a shared, rate-limited courtesy meant for
+ * acquisitions, so a typed description must not burn it. Returns null when the
+ * account configured nothing of its own — the search then stays keyword-only.
+ */
+export async function getAgentModelForSearch(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<LanguageModel | null> {
+  const resolved = await resolveAgentModelConfig(repository);
+  // "free-preset" = the account configured nothing of its own. The shipped free
+  // pool is a shared, rate-limited courtesy for acquisitions; a typed
+  // description must not spend it (and after the「换回免费模型」button the
+  // effective values ARE the preset even though the source reads "db").
+  if (resolved.source === "free-preset" || isFreeLlmPreset(resolved)) return null;
+  if (llmConfigError(resolved)) return null;
+  try {
+    return createAgentModel(resolved);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Web search for the acquisition agent, always available. When the account's
+ * configured LLM endpoint is DeepSeek's own API we search with THEIR engine and
+ * THEIR key (they already pay for it); otherwise the keyless anonymous provider
+ * is used. Never carries a key toward a third party: `resolveAgentModelConfig`
+ * drops the key whenever the effective config is the free preset.
+ */
+export async function resolveTitleResearchOptions(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<{ web: { llmBaseURL?: string; llmApiKey?: string } }> {
+  const resolved = await resolveAgentModelConfig(repository);
+  return {
+    web: {
+      ...(resolved.baseURL === undefined ? {} : { llmBaseURL: resolved.baseURL }),
+      ...(resolved.apiKey === undefined ? {} : { llmApiKey: resolved.apiKey }),
+    },
   };
 }
 
@@ -1315,6 +1599,24 @@ export async function getProwlarrConfig(
     baseURL: await read(PROWLARR_BASE_URL_SETTING_KEY, "PROWLARR_BASE_URL"),
     apiKey: await read(PROWLARR_API_KEY_SETTING_KEY, "PROWLARR_API_KEY"),
   };
+}
+
+export const HAISOU_API_KEY_SETTING_KEY = "haisou_api_key";
+
+/** 海搜 (haisou) 的官方 API key —— idatariver 项目 b9d1，站方页脚「开放接口」
+ *  指向的就是它。每日前 100 次免费，之后阶梯计费，所以它只做补充源。
+ *
+ *  为什么不走 haisou.cc 自己的 /api/v2：那条路要用户的登录 cookie
+ *  (`hs_web_session`)，匿名配额耗尽后连续 429，而且站方页面明写不要用脚本
+ *  调用。官方 API 只要一个 apikey，是站方给出的程序化入口。 */
+export async function getHaisouApiKey(
+  repository: { getSetting(key: string): Promise<string | null> },
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | undefined> {
+  const dbValue = (await repository.getSetting(HAISOU_API_KEY_SETTING_KEY))?.trim();
+  if (dbValue) return dbValue;
+  const envValue = env["HAISOU_API_KEY"]?.trim();
+  return envValue ? envValue : undefined;
 }
 
 export const JEV_API_KEY_SETTING_KEY = "jev_api_key";
@@ -1463,12 +1765,17 @@ export const PATROL_CONCURRENCY_SETTING_KEY = "patrol_max_concurrent_runs";
 export const DEFAULT_PATROL_CONCURRENCY = 1;
 export const MAX_PATROL_CONCURRENCY = 5;
 
-/** 巡检同时处理几部作品（1~5，默认 1 = 逐部）。同一块网盘上的作品始终逐部跑。 */
+/** 同时处理几部作品（1~5，默认 1 = 逐部），巡检和手动获取共用。同一块网盘上的作品始终逐部跑。 */
 export async function getPatrolConcurrency(
   repository: { getSetting(key: string): Promise<string | null> },
 ): Promise<number> {
   const value = Number((await repository.getSetting(PATROL_CONCURRENCY_SETTING_KEY))?.trim());
   return Number.isInteger(value) && value >= 1 && value <= MAX_PATROL_CONCURRENCY ? value : DEFAULT_PATROL_CONCURRENCY;
+}
+
+/** The in-process worker's limit on queued runs going at once (same setting as the patrol). */
+export async function getWorkerConcurrency(): Promise<number> {
+  return getPatrolConcurrency(getWorkflowRepository());
 }
 
 /**
@@ -1566,7 +1873,7 @@ export async function reserveCandidate(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再预定。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "预定") };
   }
   const request = await reserveMovie({
     title: movie.title,
@@ -1586,8 +1893,11 @@ async function pushNotificationsSince(
   targetRepository: WorkflowRepository,
   sinceIso: string,
   /** The sweep always sends its digest; a queue drain (a patrol-queued replace run)
-   *  skips one that would only say nothing changed (see scheduledDigestItems). */
-  opts: { sweep?: boolean } = {},
+   *  skips one that would only say nothing changed (see scheduledDigestItems).
+   *  `workflowRunId`: push only that run's notifications (its own record or its
+   *  per-season ones). A queued run passes its own id, since other runs going beside
+   *  it write notifications in the same window and each pushes its own when it finishes. */
+  opts: { sweep?: boolean; workflowRunId?: string } = {},
 ): Promise<void> {
   try {
     // Cross-account: the drain/sweep may have completed runs for several accounts.
@@ -1596,10 +1906,15 @@ async function pushNotificationsSince(
     // since is applied in the repository BEFORE the limit so a large sweep's
     // earliest notifications are not crowded out by newer already_current noise.
     // Cap is high enough for a full patrol of a large library; still bounded.
-    const recent = await targetRepository.listRecentNotificationsWithAccount({
-      since: sinceIso,
-      limit: 10_000,
-    });
+    const recent = (
+      await targetRepository.listRecentNotificationsWithAccount({
+        since: sinceIso,
+        limit: 10_000,
+      })
+    ).filter(
+      (entry) =>
+        opts.workflowRunId === undefined || isRunOrItsSeasonRecord(entry.notification.workflowRunId, opts.workflowRunId),
+    );
     if (recent.length === 0) {
       return;
     }
@@ -1683,7 +1998,7 @@ export async function queueCandidateSeries(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
     const target = await prepareSeriesTarget({
@@ -1815,6 +2130,102 @@ export function beijingDateTime(): { date: string; hhmm: string } {
   return { date: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
 }
 
+export const AUTO_UPDATE_ENABLED_SETTING_KEY = "auto_update_enabled";
+export const AUTO_UPDATE_TIME_SETTING_KEY = "auto_update_time";
+const AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY = "auto_update_last_attempt";
+export const AUTO_UPDATE_FAIL_STREAK_SETTING_KEY = "auto_update_fail_streak";
+
+/** The auto-update switch and its hour (Beijing time). Off unless explicitly turned on;
+ *  a missing or malformed hour (anything but a whole hour) reads as the 04:00 default. */
+export async function getAutoUpdateSettings(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<{ enabled: boolean; time: string }> {
+  return { enabled: await isAutoUpdateEnabled(repository), time: await getAutoUpdateTime(repository) };
+}
+
+async function isAutoUpdateEnabled(repository: { getSetting(key: string): Promise<string | null> }): Promise<boolean> {
+  return (await repository.getSetting(AUTO_UPDATE_ENABLED_SETTING_KEY))?.trim() === "1";
+}
+
+async function getAutoUpdateTime(repository: { getSetting(key: string): Promise<string | null> }): Promise<string> {
+  const time = (await repository.getSetting(AUTO_UPDATE_TIME_SETTING_KEY))?.trim();
+  return time && isAutoUpdateTime(time) ? time : DEFAULT_AUTO_UPDATE_TIME;
+}
+
+/** Failed attempts at one release. `at` is when the last counted attempt ended: one failed
+ *  attempt is counted once, however many days its status stays on the updater. */
+interface AutoUpdateFailStreak {
+  tag: string;
+  count: number;
+  at: string;
+}
+
+function parseAutoUpdateFailStreak(raw: string | null): AutoUpdateFailStreak | null {
+  if (!raw?.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutoUpdateFailStreak> | null;
+    if (
+      parsed &&
+      typeof parsed.tag === "string" &&
+      typeof parsed.count === "number" &&
+      Number.isInteger(parsed.count) &&
+      parsed.count > 0
+    ) {
+      return { tag: parsed.tag, count: parsed.count, at: typeof parsed.at === "string" ? parsed.at : "" };
+    }
+  } catch {
+    // A hand-edited or damaged value counts as no failures.
+  }
+  return null;
+}
+
+/** Daily auto-update. The worker calls this every tick (3 s): with the switch off it reads
+ *  one setting and returns, and it looks at GitHub and the updater once a day, after the
+ *  set hour. The day is used up whatever the outcome (no update, offline, a state that says
+ *  wait): the next look is tomorrow. */
+export async function runAutoUpdateIfDue(): Promise<void> {
+  if (isDemoMode() || resolveIsDesktop()) return;
+  const repository = getWorkflowRepository();
+  // Off by default and asked every tick: read the switch alone first.
+  if (!(await isAutoUpdateEnabled(repository))) return;
+  const time = await getAutoUpdateTime(repository);
+  const { date, hhmm } = beijingDateTime();
+  const lastAttemptDate = (await repository.getSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY))?.trim() ?? null;
+  if (hhmm < time || lastAttemptDate === date) return;
+  await repository.setSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY, date);
+  // Dynamic: update-view-server imports this module.
+  const { loadUpdateView } = await import("./update-view-server");
+  const { requestUpdate } = await import("./updater-client");
+  const view = await loadUpdateView();
+  if (!view.updater || !view.available) return;
+  const tag = view.available.tag;
+  let failStreak = parseAutoUpdateFailStreak(await repository.getSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY));
+  // The last attempt at this same release failed: count it (once) before deciding.
+  if (view.updater.targetTag === tag && (view.updater.phase === "rolled_back" || view.updater.phase === "failed")) {
+    const at = view.updater.finishedAt ?? view.updater.startedAt ?? "";
+    if (!failStreak || failStreak.tag !== tag) {
+      failStreak = { tag, count: 1, at };
+    } else if (failStreak.at !== at) {
+      failStreak = { tag, count: failStreak.count + 1, at };
+    }
+    await repository.setSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY, JSON.stringify(failStreak));
+  }
+  const due = shouldAutoUpdate({
+    enabled: true,
+    time,
+    now: { date, hhmm },
+    lastAttemptDate,
+    available: tag,
+    failStreak,
+    updater: view.updater,
+    updateHoldActive: isUpdateHoldActive(Date.now()),
+  });
+  if (!due) return;
+  const result = await requestUpdate(tag);
+  if (result.ok) console.log(`[auto-update] started ${tag}`);
+  else console.warn(`[auto-update] ${tag} not started: ${result.reason}`);
+}
+
 /**
  * 每日巡检（per-slot 认领 + 合并补跑）。任何触发源（worker tick / cron / 手动）都
  * 打这里：每次找出「已到点且今天未认领」的时间点，一次性全部认领并只跑一次 sweep
@@ -1822,13 +2233,24 @@ export function beijingDateTime(): { date: string; hhmm: string } {
  * 容器同一语义（原 ignoreTimeGate 特例已退役）。`force` 跑完整 sweep 但不认领任何
  * slot（run-now 不得吞掉计划任务）。
  */
-export async function runScheduledType3(options?: {
-  force?: boolean;
-}): Promise<{
+type ScheduledType3Result = {
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time" | "retry_limit_reached";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "retry_limit_reached" | "update_in_progress";
   scheduledFor?: string;
-}> {
+};
+
+export async function runScheduledType3(options?: { force?: boolean }): Promise<ScheduledType3Result> {
+  // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
+  // on the new version once the update is done.
+  if (isUpdateHoldActive(Date.now())) {
+    return { skipped: "update_in_progress", outcomes: [] };
+  }
+  // In flight for the updater's busy check: reservations and staging cleanup must not
+  // be cut by a swap. The manual 立即巡检 and cron routes come through here too.
+  return whileInFlight(() => runScheduledType3Now(options));
+}
+
+async function runScheduledType3Now(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];
@@ -1882,17 +2304,21 @@ export async function runScheduledType3(options?: {
     );
   }
   let result: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  // Set when an update hold stopped a show from being reserved mid-sweep: the sweep is
+  // then not complete, and its slots must stay open for the new version.
+  let heldBack = false;
   try {
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
     const accountId = await getCurrentAccountId();
-    const { model, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
+    const { model, llmConfig, preferredLanguage, qualityPreference } = await getAgentModel(getAccountScopedSettings(accountId));
     const parents = await getWorkerStorageParents(accountId);
     result = await runScheduledType3Monitoring({
       repository,
       resourceProvider: await getWorkerResourceProvider(),
       storage: await getWorkerStorageExecutor(accountId),
       model,
+      llmConfig,
       ...(preferredLanguage === undefined ? {} : { preferredLanguage }),
       ...(qualityPreference === undefined ? {} : { qualityPreference }),
       storageParentDirectoryId: parents.tv,
@@ -1903,19 +2329,42 @@ export async function runScheduledType3(options?: {
       resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
+      mayStartRun: () => {
+        const allowed = mayStartRun();
+        if (!allowed) heldBack = true;
+        return allowed;
+      },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+    // so the new version patrols the rest today. Seasons that did run are only re-checked.
+    const stopForUpdate = async () => {
+      if (claimedNow.length > 0) {
+        await repository.setSetting(
+          LAST_SWEEP_CLAIMS_SETTING_KEY,
+          JSON.stringify({ date: claimDate, slots: priorClaims }),
+        );
+      }
+      await pushNotificationsSince(repository, startedAt, { sweep: true });
+      return { skipped: "update_in_progress" as const, outcomes: result };
+    };
+    if (heldBack) return await stopForUpdate();
     try {
-      await sweepOrphanStagingDirs({
+      const janitor = await sweepOrphanStagingDirs({
         repository,
         drives: await stagingJanitorDrives(),
         now: new Date().toISOString(),
+        mayStartRun,
       });
+      if (janitor.held) heldBack = true;
     } catch (error) {
       console.error(
         `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    // The janitor stopped for an update, or the hold started after both had passed their
+    // checks: either way the new version should run today's sweep, so do not mark it done.
+    if (heldBack || !mayStartRun()) return await stopForUpdate();
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
     if (!options?.force) {
       await repository.setSetting(
@@ -2118,9 +2567,9 @@ function parseTvCandidateId(candidateId: string): { tmdbId: number; seasonNumber
   };
 }
 
-async function getWorkerResourceProvider(
+export async function getWorkerResourceProvider(
   settings: { getSetting(key: string): Promise<string | null> } = getWorkflowRepository(),
-  provider: string = "pan115",
+  provider: string | readonly string[] = "pan115",
   accountId?: string,
 ): Promise<ResourceProvider> {
   // accountId 仅用于健康结论回写(recordPanSouHealth)。多账户场景下,worker 在
@@ -2129,13 +2578,12 @@ async function getWorkerResourceProvider(
   // base provider 只在无 resolver(单用户/兜底)时被实际使用,此时 getCurrentAccountId()
   // 正确地返回 default 账号,所以两处都不丢账号作用域。
   if (process.env.MEDIA_TRACK_WORKFLOW_ADAPTER === "pansou") {
-    // Per-brand assembly: a quark drive gets PanSou restricted to quark links and
-    // NO Prowlarr (磁力 115-only); a 115 drive gets PanSou(115/magnet) + Prowlarr.
-    const kinds: readonly string[] = isRegisteredStorageProvider(provider)
-      ? getStorageBrand(provider).resourceProviderKinds
-      : ["pansou-115", "prowlarr"];
-    // 夸克 → quark-only links; 光鸭 → guangya + magnet; 115 → 115 + magnet.
-    const allowedTypes: ResourceType[] = allowedResourceTypesForKinds(kinds);
+    // Unified multi-drive assembly: take the UNION of resourceProviderKinds across
+    // all active connected drives so the agent sees candidates from every connected
+    // drive at once (and Prowlarr is included whenever at least one active drive
+    // supports magnets).
+    const providerList: readonly string[] = typeof provider === "string" ? [provider] : provider;
+    const { kinds, allowedTypes } = allowedResourceTypesForProviders(providerList);
     const providers: Array<{ name: string; provider: ResourceProvider }> = [
       {
         name: "pansou",
@@ -2164,6 +2612,16 @@ async function getWorkerResourceProvider(
           provider: new ProwlarrResourceProvider({ baseURL: prowlarr.baseURL, apiKey: prowlarr.apiKey }),
         });
       }
+    }
+    // 海搜：站方官方 API（idatariver b9d1），配了 key 才启用。它排在 PanSou 之后
+    // 只是数组顺序，没有优先级含义 —— Composite 是并集去重。每日前 100 次免费，
+    // 按实际巡检量（一天一个时间点、活跃季个位数）绰绰有余。
+    const haisouApiKey = await getHaisouApiKey(settings);
+    if (haisouApiKey) {
+      providers.push({
+        name: "haisou",
+        provider: new HaisouResourceProvider({ apiKey: haisouApiKey, allowedTypes }),
+      });
     }
     return providers.length > 1
       ? new CompositeResourceProvider({ providers })
@@ -2263,13 +2721,19 @@ async function provisionDriveCategoryDirs(
   const brand = getStorageBrand(provider);
   const baseParentId = brand.provisionRootId;
   // Dispatch on authKind (registry) so ANY token brand takes the credential path —
-  // a future token brand won't silently fall through to the 115/夸克 cookie path.
-  const executor =
-    brand.authKind === "token"
-      ? createExecutorForBrand({ provider, credential: credential ?? {}, scopeCids: [] })
-      : provider === "quark"
-        ? createExecutorForBrand({ provider: "quark", cookie, scopeCids: [] })
-        : createBootstrapPan115CookieStorageExecutor({ cookie });
+  // a future token brand won't silently fall through to the cookie path. Cookie
+  // brands then split on the family: 115 has its own executor; 阿里云盘族 (夸克/UC)
+  // shares one, so `provider` is passed straight through. Hardcoding "quark" here
+  // (the pre-UC form) dropped a UC drive into the 115 bootstrap — wrong protocol,
+  // and the provision silently failed, leaving the drive with no CIDs.
+  let executor: StorageExecutor;
+  if (brand.authKind === "token") {
+    executor = createExecutorForBrand({ provider, credential: credential ?? {}, scopeCids: [] });
+  } else if (provider === "pan115") {
+    executor = createBootstrapPan115CookieStorageExecutor({ cookie });
+  } else {
+    executor = createExecutorForBrand({ provider, cookie, scopeCids: [] });
+  }
   return provisionCategoryDirs({
     baseParentId,
     ...customDirNamesFromEnv(process.env),
@@ -2436,20 +2900,39 @@ async function getAccountStorageCredentials(
  * queue entrypoints can refuse — a frozen drive (cookie died) must not accept
  * acquisition until re-bound. id is null when the account has no 115 drive yet.
  */
-async function resolveQueueStorage(
+export async function resolveQueueStorage(
   accountId: string,
   explicitConnectedStorageId?: string | null,
-): Promise<{ id: string | null; frozen: boolean; unknown: boolean }> {
+): Promise<{ id: string | null; frozen: boolean; unknown: boolean; provider: string | null }> {
   try {
     const storages = (await getWorkflowRepository().listConnectedStorages(accountId)).filter(
       (storage) => isRegisteredStorageProvider(storage.provider),
     );
-    return resolveQueueStorageChoice(storages, explicitConnectedStorageId);
+    const order = await getAccountDriveOrder(accountId);
+    const ordered = sortDrivesByOrder(storages, order);
+    if (!explicitConnectedStorageId) {
+      const firstActive = ordered.find((s) => s.status !== "frozen");
+      if (firstActive) {
+        return { id: firstActive.id, frozen: false, unknown: false, provider: firstActive.provider };
+      }
+      const firstFrozen = ordered[0];
+      if (firstFrozen) {
+        return { id: firstFrozen.id, frozen: true, unknown: false, provider: firstFrozen.provider };
+      }
+    }
+    const choice = resolveQueueStorageChoice(ordered, explicitConnectedStorageId);
+    return { ...choice, provider: ordered.find((storage) => storage.id === choice.id)?.provider ?? null };
   } catch {
     // Fail closed: transient DB errors must not queue unscoped or drop an
     // explicit workspace pin (would land on the wrong drive).
-    return { id: null, frozen: false, unknown: true };
+    return { id: null, frozen: false, unknown: true, provider: null };
   }
+}
+
+/** Refusal for a queue/reserve action on a drive whose login died: re-scan THAT brand. */
+export function frozenDriveMessage(provider: string | null, action: "获取" | "预定"): string {
+  const label = provider ? getStorageBrand(provider).label : "网盘";
+  return `该网盘已掉线，请重新扫码绑定同一个${label}后再${action}。`;
 }
 
 /** Marks a drive frozen — its cookie died. Called when a worker/probe hits a
@@ -2492,6 +2975,7 @@ export async function testConnection(
       makeTokenPersister(accountId, creds.id, creds.provider),
     );
     await getWorkflowRepository().setConnectedStorageStatus(creds.id, "active", null, null);
+    await resolveCachedDriveSpace(accountId, creds.id, "active", { forceRefresh: true });
     return { ok: true, status: "active", message: "连接正常。" };
   } catch (error) {
     // The brand's own dead-cookie signal → freeze; anything else (network/
@@ -2515,7 +2999,9 @@ async function probeStorageConnection(
   // testConnection (an existing drive). Omitted at first-connect (no row yet).
   onCredentialRefresh?: ((creds: unknown) => Promise<void>) | undefined,
 ): Promise<void> {
-  const { Pan115CookieClient, Pan123Client, QuarkCookieClient, TianyiClient } = await import("@media-track/workflow");
+  const { Pan115CookieClient, Pan123Client, QuarkCookieClient, TianyiClient } = await import(
+    "@media-track/workflow"
+  );
   if (provider === "guangya") {
     const blob = (credential ?? {}) as { accessToken?: string; refreshToken?: string; deviceId?: string };
     // Token-auth: validateToken() does account/v1/user/me + refresh-retry on 401;
@@ -2566,6 +3052,12 @@ async function probeStorageConnection(
   }
   if (provider === "quark") {
     await new QuarkCookieClient({ cookie }).listItems({ directoryId: rootCid ?? "0" });
+    return;
+  }
+  if (provider === "uc") {
+    // Same family client, UC profile. A dead cookie throws the family auth error
+    // (code 31001) → registry isAuthError freezes the drive.
+    await new QuarkCookieClient({ cookie, profile: UC_PROFILE }).listItems({ directoryId: rootCid ?? "0" });
     return;
   }
   if (provider === "pan115") {
@@ -2780,7 +3272,7 @@ export async function selectBookResource(input: {
 
 /** Reconcile an asynchronous share save when its detail page is opened later. */
 export async function refreshPendingBookEntry(bookId: string, storageId?: string) {
-  const scope = await getActiveWorkspaceScope(storageId);
+  const scope = await getBookWorkspaceScope(storageId);
   const repository = getWorkflowRepository();
   const entry = await repository.getBookEntry(bookId, scope);
   if (!entry || entry.status !== "pending") return entry;
@@ -2831,34 +3323,76 @@ async function getWorkerStorageParents(
  */
 /** Resolve the live agent model config the SAME way the worker builds it: DB
  *  (pass an account-scoped repo) → .env (AGENT_MODEL_* with XIAOMI_MIMO_* as a
- *  back-compat fallback) → undefined. There is NO built-in default endpoint —
- *  baseURL/modelId must be configured (truly BYO, issue #49). Shared by
- *  getAgentModel and testLlmConnectionAction so the Settings「测试连接」exercises
- *  exactly what acquisitions use. */
+ *  back-compat fallback) → 出厂免费预设 FREE_LLM_PRESET（Kilo 免费池，issue #52
+ *  之后的兜底层）。回落只看 baseURL 与 modelId：两者都空（未设或空串，含
+ *  .env.example 照抄形态）即视为无自定义配置、回落免费预设，所以 baseURL/modelId
+ *  永远有可用值 —— 未配置的自部署实例开箱即用。apiKey 不参与回落判定，理由：
+ *  ①key 没有独立意义，url/model 双空=没配自己的服务（设置页「清空地址保存」后
+ *  DB 只剩 blank-keep 的 key，正是这个形态，不能再让它阻断回落）；②回落分支返回
+ *  FREE_LLM_PRESET 且不携带 apiKey —— 残留 key 属于用户自配服务（如 DeepSeek），
+ *  绝不能作为 Authorization 头发给 Kilo 免费池第三方（免费池本就无 key 调用）；
+ *  ③非回落分支同样防 —— 生效 baseURL/modelId 逐字等于免费预设（isFreeLlmPreset，
+ *  「换回免费模型」按钮写库后的形态）时也不携带 apiKey，DB 里的 key 原样保留、
+ *  供用户换回自带服务时复用（丢弃只发生在本函数的返回值，不动库）。
+ *  注意 env 层的 createAgentModelFromEnv 维持「三键全空」判定不动 —— env 是运维
+ *  显式配置，语义不同。半截配置（baseURL/modelId 只有一边非空）照旧原样返回，
+ *  由下游 llmConfigError fail-fast（用户错误不静默变免费池）。Shared by
+ *  getAgentModel and testLlmConnectionAction so the Settings 「测试连接」exercises
+ *  exactly what acquisitions use.
+ *
+ *  `source` 标记生效值来自哪一层（DB 层参与了任何一项就算 db）：设置页（Task 4）
+ *  用它判定免费档（"free-preset"）与「来自环境变量」的呈现，不用再跑一次 predicate。 */
 export async function resolveAgentModelConfig(
   repository: { getSetting(key: string): Promise<string | null> },
   env: NodeJS.ProcessEnv = process.env,
-): Promise<{ apiKey?: string; baseURL?: string; modelId?: string }> {
+): Promise<{ apiKey?: string; baseURL?: string; modelId?: string; source: "db" | "env" | "free-preset" }> {
   const llm = await getLlmConfig(repository);
-  const apiKey = llm.apiKey ?? env.AGENT_MODEL_API_KEY ?? env.XIAOMI_MIMO_API_KEY;
-  const baseURL = llm.baseURL ?? env.AGENT_MODEL_BASE_URL ?? env.XIAOMI_MIMO_BASE_URL;
-  const modelId = llm.modelId ?? env.AGENT_MODEL_ID ?? env.XIAOMI_MIMO_MODEL_ID;
-  return {
-    ...(apiKey === undefined ? {} : { apiKey }),
+  // env 内部的 modern→legacy 兜底 blank-aware（Copilot r2 B）：出厂 .env.example
+  // 带三个空串 AGENT_MODEL_* 键，与有值的 XIAOMI_MIMO_* 并存时空串不能遮蔽
+  // legacy 值 —— 否则下面的免费预设回落会把用户的 legacy 服务静默换成 Kilo。
+  // 与 agent-model.ts 的 createAgentModelFromEnv 同一条规则（isBlankEnvValue
+  // 自 @media-track/workflow 导入，单一谓词，无跨包复制体）。DB→env 的 ??
+  // 不动：DB 值 undefined 才看 env 是既有语义（DB 空串已在 getLlmConfig 归一为
+  // undefined）。
+  const pickEnvValue = (modern: string | undefined, legacy: string | undefined): string | undefined =>
+    isBlankEnvValue(modern) ? legacy : modern;
+  const apiKey = llm.apiKey ?? pickEnvValue(env.AGENT_MODEL_API_KEY, env.XIAOMI_MIMO_API_KEY);
+  const baseURL = llm.baseURL ?? pickEnvValue(env.AGENT_MODEL_BASE_URL, env.XIAOMI_MIMO_BASE_URL);
+  const modelId = llm.modelId ?? pickEnvValue(env.AGENT_MODEL_ID, env.XIAOMI_MIMO_MODEL_ID);
+  // 出厂回落：只看 baseURL 与 modelId（都比 env 层的「三键全空」宽一档，理由见上）。
+  if (isBlankEnvValue(baseURL) && isBlankEnvValue(modelId)) {
+    // 不带 apiKey：FREE_LLM_PRESET 本就只有 baseURL/modelId，残留 key 就地丢弃（②）。
+    return { ...FREE_LLM_PRESET, source: "free-preset" };
+  }
+  const source =
+    llm.apiKey !== undefined || llm.baseURL !== undefined || llm.modelId !== undefined ? "db" : "env";
+  // 生效配置逐字等于免费池预设（无论值来自 DB 还是 env —— 前者即「换回免费
+  // 模型」按钮写库后的形态：地址+模型名来自预设、key 是 blank-keep 留下的残留）
+  // → 与回落分支同样不携带 apiKey：残留 key 属于用户自带服务（如 DeepSeek），
+  // 不得作为 Authorization 头发给 Kilo 第三方免费池。丢弃只发生在返回值，
+  // DB 里的 key 原样保留，供用户换回自带服务时复用。
+  const presetValued = isFreeLlmPreset({
     ...(baseURL === undefined ? {} : { baseURL }),
     ...(modelId === undefined ? {} : { modelId }),
+  });
+  return {
+    ...(apiKey === undefined || presetValued ? {} : { apiKey }),
+    ...(baseURL === undefined ? {} : { baseURL }),
+    ...(modelId === undefined ? {} : { modelId }),
+    source,
   };
 }
 
-/** Acquire-time LLM pre-check (issue #52): the friendly "configure your model"
- *  message if a LIVE (vercel-ai) acquisition can't run for lack of LLM config,
- *  else null. Resolves config EXACTLY as the worker's getAgentModel does
- *  (account-scoped DB → .env) and reuses the SAME llmConfigError predicate, so a
- *  click that would only die later in the worker is caught NOW — no doomed run is
- *  enqueued, no failed card piles up in 活动. The fake/demo adapter never needs an
- *  LLM → always null (never blocks demo/fake). Common case (configured) → null →
- *  callers behave byte-identically to before (purely additive). Settings/env are
- *  injectable for unit tests; production calls pass the current account id. */
+/** Acquire-time LLM pre-check (issue #52)，随出厂免费预设收窄：对**生效配置**
+ *  （resolveAgentModelConfig：DB → env → FREE_LLM_PRESET 回落）跑 llmConfigError。
+ *  零配置 → 回落补齐 baseURL/modelId → 校验通过 → 返 null 不拦（开箱即用语义
+ *  保留，#52 原先拦的「完全没配」场景已不存在）；半截配置（DB 或 env 的
+ *  baseURL/modelId 一空一非空——saveLlmConfigAction 允许存这种行）→ 回落不
+ *  触发（回落只认两键全空）→ 返回可行动文案，点击获取时友好拦截。不拦的话
+ *  run 会入队，单用户（默认账号）路径的 getAgentModel 在 claim 之前抛
+ *  llmConfigError，异常传出 drain（background-worker 只 console.error）→ run
+ *  永久 queued、无失败卡、无通知 —— ghost run。fake/demo adapter 不需要 LLM
+ *  → 恒 null（永不拦 demo/fake）。签名与 actions.ts 的调用点保持不变。 */
 export async function acquireLlmPreflightError(
   arg:
     | string
@@ -2880,6 +3414,10 @@ async function getAgentModel(repository: {
   getSetting(key: string): Promise<string | null>;
 }): Promise<{
   model: ReturnType<typeof createAgentModelFromEnv>;
+  /** The config that built `model` (baseURL/modelId only — NEVER the apiKey: the
+   *  worker only needs it to run isFreeLlmPreset for the free-tier failure copy).
+   *  The stub (fake adapter) path carries the resolved values all the same. */
+  llmConfig: { baseURL?: string; modelId?: string };
   preferredLanguage: string | undefined;
   qualityPreference: "high" | "medium" | undefined;
 }> {
@@ -2890,15 +3428,18 @@ async function getAgentModel(repository: {
   const qualityPreference = await getQualityPreference(repository);
 
   // Resolve the live model config the SAME way the test action does (shared
-  // resolver) — DB-first, then .env. No built-in default endpoint.
+  // resolver) — DB-first, then .env, then the shipped free preset
+  // (baseURL+modelId 双空回落，key 不参与判定).
   const resolved = await resolveAgentModelConfig(repository, env);
   const { apiKey, baseURL, modelId } = resolved;
   // Fail-fast pre-check (issue #49): on the live (vercel-ai) path, if baseURL or
-  // modelId is missing the run would die on its first model call (or hit the
-  // author endpoint keyless → 401). Throw the actionable, agnostic guidance NOW
-  // — before building/using the model — so the user gets guidance at 获取 time
-  // instead of a raw failure after a long agent run. apiKey may be empty (keyless
-  // local LLM is valid); the fake/stub adapter never needs a model config.
+  // modelId is missing the run would die on its first model call. With the free
+  // preset fallback this only trips on HALF-configured setups (e.g. a baseURL
+  // without a modelId) — a user error that must not silently become the free
+  // pool. Throw the actionable, agnostic guidance NOW — before building/using
+  // the model — so the user gets guidance at 获取 time instead of a raw failure
+  // after a long agent run. apiKey may be empty (keyless local LLM is valid);
+  // the fake/stub adapter never needs a model config.
   if (adapter === "vercel-ai") {
     const configError = llmConfigError(resolved);
     if (configError) {
@@ -2913,7 +3454,13 @@ async function getAgentModel(repository: {
     model = adapter === "vercel-ai" ? createAgentModel(resolved) : createStubAcquisitionModel();
     agentModelCache.set(signature, model);
   }
-  return { model, preferredLanguage, qualityPreference };
+  // Deliberately WITHOUT apiKey (see return type): the worker's llmConfig is a
+  // display/copy hint (isFreeLlmPreset), not a credential carrier.
+  const llmConfig = {
+    ...(baseURL === undefined ? {} : { baseURL }),
+    ...(modelId === undefined ? {} : { modelId }),
+  };
+  return { model, llmConfig, preferredLanguage, qualityPreference };
 }
 
 function fakeTransferOutcomes() {
@@ -2968,7 +3515,7 @@ function animeParentDirectoryId(): string {
 }
 
 function defaultQuality(): string {
-  return process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K";
+  return "4K";
 }
 
 export interface ForeignWorkFinding {
@@ -3001,17 +3548,27 @@ export async function importForeignWorkFiles(input: {
   movieTitle: string;
   year: number;
 }): Promise<{ movieDirectoryId: string; movedFileIds: string[] }> {
-  // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
-  // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
-  // `{tmdb-N}` only when a caller passes tmdbId.
-  const accountId = await getCurrentAccountId();
-  const parents = await getWorkerStorageParents(accountId);
-  return importForeignWorkAsMovie({
-    storage: await getWorkerStorageExecutor(accountId),
-    providerFileIds: input.providerFileIds,
-    movieTitle: input.movieTitle,
-    year: input.year,
-    moviesParentDirectoryId: parents.movies,
+  // Count as in flight: this creates a folder and moves files on the drive. A container
+  // swap mid-way would leave the folder made and the files half moved, and the retry
+  // then fails. /api/update/busy waits for this to settle before the updater swaps.
+  return whileInFlight(async () => {
+    // Recheck the hold now that this import is counted in flight. The action checks it too,
+    // but between that check and this increment the updater could take the hold and see
+    // inFlightCount() === 0 (busy:false), then swap mid-move. Ordering the increment before
+    // this check closes that gap: if the hold is on here, the swap has not been cleared yet.
+    if (isUpdateHoldActive(Date.now())) throw new UpdateInProgressError();
+    // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
+    // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
+    // `{tmdb-N}` only when a caller passes tmdbId.
+    const accountId = await getCurrentAccountId();
+    const parents = await getWorkerStorageParents(accountId);
+    return importForeignWorkAsMovie({
+      storage: await getWorkerStorageExecutor(accountId),
+      providerFileIds: input.providerFileIds,
+      movieTitle: input.movieTitle,
+      year: input.year,
+      moviesParentDirectoryId: parents.movies,
+    });
   });
 }
 
@@ -3121,28 +3678,140 @@ export interface ConnectedStorageView {
   status: "active" | "frozen";
   /** True once category directories are provisioned (CIDs stored). */
   provisioned: boolean;
+  /** Cached or freshly probed drive space (totalBytes / usedBytes). Null when never probed. */
+  space?: DriveSpaceInfo | null;
 }
 
 /**
  * §7 P2: the CURRENT account's connected network drives, sanitized for the
  * settings UI — the cookie/payload is NEVER exposed, only display metadata.
  */
-export async function getAccountConnectedStorages(): Promise<ConnectedStorageView[]> {
+export async function getAccountConnectedStorages(options?: {
+  includeSpace?: boolean;
+}): Promise<ConnectedStorageView[]> {
   const accountId = await getCurrentAccountId();
-  const rows = await getWorkflowRepository().listConnectedStorages(accountId);
-  return rows.map((row) => {
-    const meta = (row.payload as { meta?: { connectedAt?: string } } | null)?.meta;
-    return {
-      id: row.id,
-      provider: row.provider,
-      providerUid: row.providerUid,
-      label: row.label,
-      connectedAt: meta?.connectedAt ?? null,
-      createdAt: row.createdAt,
-      status: row.status,
-      provisioned: Boolean(row.tvCid && row.moviesCid && row.animeCid),
-    };
+  const repository = getWorkflowRepository();
+  const rawRows = await repository.listConnectedStorages(accountId);
+  const order = await getAccountDriveOrder(accountId, repository);
+  const rows = sortDrivesByOrder(rawRows, order);
+  const includeSpace = options?.includeSpace === true;
+  return Promise.all(
+    rows.map(async (row) => {
+      const meta = (row.payload as { meta?: { connectedAt?: string } } | null)?.meta;
+      const space = includeSpace ? await resolveCachedDriveSpace(accountId, row.id, row.status) : undefined;
+      return {
+        id: row.id,
+        provider: row.provider,
+        providerUid: row.providerUid,
+        label: row.label,
+        connectedAt: meta?.connectedAt ?? null,
+        createdAt: row.createdAt,
+        status: row.status,
+        provisioned: Boolean(row.tvCid && row.moviesCid && row.animeCid),
+        ...(space === undefined ? {} : { space }),
+      };
+    }),
+  );
+}
+
+const inFlightSpaceProbes = new Map<string, Promise<DriveSpaceInfo | null>>();
+
+/**
+ * Resolve a drive's space with a 30-minute DB cache (`drive_space_cache`).
+ * When the cache is fresh, returns it without network I/O; when expired or
+ * missing on an active drive, probes via a lightweight read-only executor and
+ * updates the cache; on probe failure, falls back to the stale cached entry.
+ */
+export async function resolveCachedDriveSpace(
+  accountId: string,
+  storageId: string,
+  status: "active" | "frozen" = "active",
+  options?: { forceRefresh?: boolean },
+): Promise<DriveSpaceInfo | null> {
+  const inflightKey = `${accountId}:${storageId}:${options?.forceRefresh ? "force" : "normal"}`;
+  const existing = inFlightSpaceProbes.get(inflightKey);
+  if (existing) {
+    return existing;
+  }
+  const run = (async (): Promise<DriveSpaceInfo | null> => {
+    const repository = getWorkflowRepository();
+    let cached: DriveSpaceCacheEntry | null = null;
+    try {
+      cached = (await repository.getDriveSpaceCache?.(storageId)) ?? null;
+    } catch (error) {
+      console.warn(`[drive-space] cache read failed for ${storageId}: ${String(error)}`);
+    }
+
+    const nowMs = Date.now();
+    const probedMs = cached ? Date.parse(cached.probedAt) : Number.NaN;
+    const isFresh =
+      !options?.forceRefresh &&
+      cached !== null &&
+      Number.isFinite(probedMs) &&
+      nowMs - probedMs < DRIVE_SPACE_CACHE_TTL_MS;
+
+    if (isFresh && cached) {
+      return { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes };
+    }
+
+    if (status === "frozen" || process.env.MEDIA_TRACK_STORAGE_ADAPTER !== "115") {
+      return cached ? { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes } : null;
+    }
+
+    try {
+      const storages = await repository.listConnectedStorages(accountId);
+      const drive = storages.find(
+        (s) => s.id === storageId && isRegisteredStorageProvider(s.provider),
+      );
+      if (!drive) {
+        return cached ? { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes } : null;
+      }
+      const { cookie, credential } = extractStorageCredential(drive.provider, drive.payload);
+      if (!cookie && !credential) {
+        return cached ? { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes } : null;
+      }
+      const scopeCids = [drive.rootCid, drive.moviesCid, drive.tvCid, drive.animeCid].filter(
+        (cid): cid is string => Boolean(cid),
+      );
+      const executor =
+        getStorageBrand(drive.provider).authKind === "token"
+          ? createExecutorForBrand({
+              provider: drive.provider,
+              credential: credential ?? {},
+              scopeCids,
+              env: process.env,
+              onCredentialRefresh: makeTokenPersister(accountId, drive.id, drive.provider),
+            })
+          : createExecutorForBrand({
+              provider: drive.provider,
+              cookie,
+              scopeCids,
+              env: process.env,
+            });
+      if (!executor.getSpace) {
+        return cached ? { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes } : null;
+      }
+      const fresh = await executor.getSpace();
+      if (fresh && Number.isFinite(fresh.totalBytes) && Number.isFinite(fresh.usedBytes) && fresh.totalBytes > 0) {
+        await repository.upsertDriveSpaceCache?.({
+          storageId,
+          totalBytes: fresh.totalBytes,
+          usedBytes: fresh.usedBytes,
+          probedAt: new Date(nowMs).toISOString(),
+        });
+        return fresh;
+      }
+    } catch (error) {
+      console.warn(`[drive-space] probe failed for ${storageId}, falling back to cached value: ${String(error)}`);
+    }
+
+    return cached ? { totalBytes: cached.totalBytes, usedBytes: cached.usedBytes } : null;
+  })().finally(() => {
+    inFlightSpaceProbes.delete(inflightKey);
   });
+
+  inFlightSpaceProbes.set(inflightKey, run);
+  return run;
 }
 
 /** Thrown when a QR connect targets a 115 already bound to a DIFFERENT account
@@ -3151,6 +3820,20 @@ export class StorageOwnedByOtherAccountError extends Error {
   constructor() {
     super("该网盘账号已被本实例的其他用户连接，无法重复绑定。");
     this.name = "StorageOwnedByOtherAccountError";
+  }
+}
+
+/** A same-account re-login is the re-bind a 掉线 card asks for (「重新绑定即恢复」): store the
+ *  fresh credential and bring the drive back. The upsert deliberately keeps the status,
+ *  so the unfreeze is explicit here; until it runs, patrol and acquisition skip the drive. */
+async function refreshConnectedStorage(
+  repository: ReturnType<typeof getWorkflowRepository>,
+  existing: { id: string; status: "active" | "frozen" },
+  row: Parameters<ReturnType<typeof getWorkflowRepository>["upsertConnectedStorage"]>[0],
+): Promise<void> {
+  await repository.upsertConnectedStorage(row);
+  if (existing.status === "frozen") {
+    await repository.setConnectedStorageStatus(existing.id, "active", null, null);
   }
 }
 
@@ -3198,7 +3881,7 @@ async function bindTokenConnectedStorage(input: {
   const payload = { ...credentialBlob, meta };
   if (decision.action === "refresh" && existing) {
     // Same account re-login → refresh the credential blob, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
       provider,
@@ -3275,7 +3958,7 @@ async function bindPan115ConnectedStorage(input: {
   };
   if (decision.action === "refresh" && existing) {
     // Keep the already-resolved directory CIDs; only refresh the cookie.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId: input.accountId,
       provider: "pan115",
@@ -3389,20 +4072,39 @@ export async function completePan115QrLogin(input: {
  * media-track/{Movies,TV,Anime} tree on a genuinely new connection (best-effort).
  */
 export async function connectQuarkCookie(rawCookie: string): Promise<{ providerUid: string }> {
+  return connectCloudFamilyCookie(rawCookie, "quark");
+}
+
+/** Settings "添加网盘 → UC网盘". Same family protocol as 夸克 — one implementation,
+ *  driven by the brand registry (label + provisioning root), so a future family
+ *  member needs no new connect path. */
+export async function connectUcCookie(rawCookie: string): Promise<{ providerUid: string }> {
+  return connectCloudFamilyCookie(rawCookie, "uc");
+}
+
+/** Bind a pasted cookie for a 阿里云盘族 brand (夸克 / UC). Enforces instance-wide
+ *  ownership, live-probes BEFORE binding, and provisions the media tree on a
+ *  genuinely new connection. */
+async function connectCloudFamilyCookie(
+  rawCookie: string,
+  provider: "quark" | "uc",
+): Promise<{ providerUid: string }> {
+  const label = getStorageBrand(provider).label;
   const cookie = rawCookie.trim();
   if (!cookie) {
-    throw new Error("请粘贴夸克 cookie。");
+    throw new Error(`请粘贴${label} cookie。`);
   }
-  const providerUid = parseQuarkUid(cookie);
+  // Identical cookie key names across the family (verified live on UC).
+  const providerUid = parseCloudDriveUid(cookie);
   if (!providerUid) {
     throw new Error(
-      "无法从该 cookie 解析夸克账号（需包含 __uid 或 __kps）；请从浏览器 Network 请求头复制完整 Cookie（Copy as cURL 最省事）。",
+      `无法从该 cookie 解析${label}账号（需包含 __uid 或 __kps）；请从浏览器 Network 请求头复制完整 Cookie（Copy as cURL 最省事）。`,
     );
   }
   const accountId = await requireAuthenticatedAccountId();
   const repository = getWorkflowRepository();
-  const existing = await repository.findConnectedStorageByUid("quark", providerUid);
-  const decision = resolveStorageBinding({ provider: "quark", providerUid, accountId, existing });
+  const existing = await repository.findConnectedStorageByUid(provider, providerUid);
+  const decision = resolveStorageBinding({ provider, providerUid, accountId, existing });
   if (decision.action === "reject") {
     throw new StorageOwnedByOtherAccountError();
   }
@@ -3411,20 +4113,20 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
   // existing.rootCid (that is the mediary category tree — user may have deleted
   // it; a missing layout dir must not block cookie refresh).
   try {
-    await probeStorageConnection("quark", cookie, "0", null);
+    await probeStorageConnection(provider, cookie, "0", null);
   } catch (error) {
     throw new Error(
-      `无法用该 cookie 连接夸克：${error instanceof Error ? error.message : String(error)}`,
+      `无法用该 cookie 连接${label}：${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
   }
   const payload = { cookie, meta: { connectedAt: new Date().toISOString() } };
   if (decision.action === "refresh" && existing) {
     // Same account re-bind → refresh the cookie, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
-      provider: "quark",
+      provider,
       providerUid,
       label: existing.label,
       payload,
@@ -3446,9 +4148,9 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
     animeCid: null,
   };
   try {
-    const executor = createExecutorForBrand({ provider: "quark", cookie, scopeCids: [] });
+    const executor = createExecutorForBrand({ provider, cookie, scopeCids: [] });
     cids = await provisionCategoryDirs({
-      baseParentId: getStorageBrand("quark").provisionRootId, // 夸克 account root ("0")
+      baseParentId: getStorageBrand(provider).provisionRootId, // family account root ("0")
       ...customDirNamesFromEnv(process.env),
       storage: {
         listChildDirs: (parentId: string) => executor.listChildDirectories(parentId),
@@ -3456,13 +4158,13 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
       },
     });
   } catch (error) {
-    console.error(`[media-track] 夸克 directory provision failed (will store without CIDs): ${String(error)}`);
+    console.error(`[media-track] ${label} directory provision failed (will store without CIDs): ${String(error)}`);
   }
   const idSuffix = providerUid.replace(/[^A-Za-z0-9]/g, "").slice(0, 48);
   await repository.upsertConnectedStorage({
-    id: `cs_quark_${idSuffix}`,
+    id: `cs_${provider}_${idSuffix}`,
     accountId,
-    provider: "quark",
+    provider,
     providerUid,
     label: null,
     payload,
@@ -3481,9 +4183,26 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
  * 有效性由用户真机扫码确认;兑换失败时设置页折叠的 cookie 粘贴是回退。
  */
 export async function completeQuarkQrLogin(serviceTicket: string): Promise<{ providerUid: string }> {
-  const { QuarkQrLoginClient } = await import("@media-track/workflow");
-  const { cookie } = await new QuarkQrLoginClient().exchangeCookie(serviceTicket);
-  return connectQuarkCookie(cookie);
+  return completeCloudFamilyQrLogin(serviceTicket, "quark");
+}
+
+/** Settings "添加网盘 → UC网盘": finish a UC QR scan. Same family CAS flow as 夸克 —
+ *  only the QR profile differs, so the whole exchange+bind path is shared. */
+export async function completeUcQrLogin(serviceTicket: string): Promise<{ providerUid: string }> {
+  return completeCloudFamilyQrLogin(serviceTicket, "uc");
+}
+
+/** Redeem a CAS service_ticket into a drive cookie and bind it, for a 阿里云盘族
+ *  brand. ⚠️ The ticket→cookie hop is the fragile one on both brands; a failure
+ *  here surfaces to the UI, which offers cookie paste as the fallback. */
+async function completeCloudFamilyQrLogin(
+  serviceTicket: string,
+  provider: "quark" | "uc",
+): Promise<{ providerUid: string }> {
+  const { QuarkQrLoginClient, QUARK_QR_PROFILE, UC_QR_PROFILE } = await import("@media-track/workflow");
+  const profile = provider === "uc" ? UC_QR_PROFILE : QUARK_QR_PROFILE;
+  const { cookie } = await new QuarkQrLoginClient({ profile }).exchangeCookie(serviceTicket);
+  return provider === "uc" ? connectUcCookie(cookie) : connectQuarkCookie(cookie);
 }
 
 /**

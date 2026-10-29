@@ -44,7 +44,7 @@ export function SearchForm({
           key={defaultQuery}
           name="q"
           aria-label={kind === "book" ? "搜索书籍资源" : "搜索媒体"}
-          placeholder={kind === "book" ? "书名 / 作者" : "片名 / 剧名"}
+          placeholder={kind === "book" ? "书名 / 作者" : "片名 / 剧名，也可以描述剧情"}
           defaultValue={defaultQuery}
         />
       </label>

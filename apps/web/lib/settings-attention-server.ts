@@ -1,12 +1,12 @@
 import {
   getStorageBrand,
   isRegisteredStorageProvider,
+  llmConfigError,
   resolveWorkspaceFromParam,
   type WorkflowRepository,
 } from "@media-track/workflow";
 import { isDemoMode } from "./demo-mode";
-import { loadDeploymentUpdateState } from "./deployment-update-server";
-import { DEFAULT_LOCAL_ORIGIN } from "./request-origin";
+import { loadUpdateView } from "./update-view-server";
 import {
   ATTENTION_DISMISSED_KEY,
   ATTENTION_SEEN_AT_KEY,
@@ -20,11 +20,11 @@ import {
 import {
   getAccountScopedSettings,
   getCurrentAccountId,
-  getLlmConfig,
   getWorkflowRepository,
   isMultiUserEnabled,
   PANSOU_BASE_URL_SETTING_KEY,
   PANSOU_HEALTH_SETTING_KEY,
+  resolveAgentModelConfig,
   UNAUTHENTICATED_ACCOUNT_ID,
 } from "./workflow-runtime";
 
@@ -42,6 +42,10 @@ async function resolveIsOwner(
   repository: WorkflowRepository,
   accountId: string,
 ): Promise<boolean> {
+  // 单用户下经隧道来的匿名访客只要带任意 mt_session cookie 就能过 proxy(它只查
+  // 有无),getCurrentAccountId() 会把这样的请求解析成这个哨兵账号。哨兵绝不是站主——
+  // 否则匿名访客就能读更新日志尾、点「立即更新」。必须在放行单用户之前先挡掉。
+  if (accountId === UNAUTHENTICATED_ACCOUNT_ID) return false;
   if (!isMultiUserEnabled()) return true;
   const account = await repository.getAccountById(accountId);
   return account?.isOwner ?? false;
@@ -75,11 +79,9 @@ async function loadAttentionState(
 const MAX_DISMISSALS = 100;
 
 /** Account-scoped attention items for Settings badge + Action Inbox.
- *  Resolves account + drives once; optional `w` preserves workspace on deep-links.
- *  `origin` (public request origin) is baked into the update prompt. */
+ *  Resolves account + drives once; optional `w` preserves workspace on deep-links. */
 export async function loadSettingsAttentionSummary(options?: {
   w?: string | null;
-  origin?: string;
 }): Promise<SettingsAttentionSummary> {
   if (isDemoMode()) {
     return { count: 0, severity: null, items: [] };
@@ -93,8 +95,16 @@ export async function loadSettingsAttentionSummary(options?: {
     options?.w ?? undefined,
   );
 
+  // 「未配置 AI 模型」提醒的口径必须与获取链路一致：resolveAgentModelConfig
+  // 会经 DB → env → 出厂免费预设（Kilo 免费池）回落，零配置出厂态下生效配置
+  // 依然存在（baseURL/modelId 永远有值）——看原始 DB 配置（getLlmConfig）会把
+  // 开箱即用的出厂态误报成「还没配置 AI 模型」。提醒只剩一个真语义：生效配置
+  // 真的无法构造模型（半截配置：只有地址没模型名，回落分支不接这种用户错误）。
+  // 判定用 llmConfigError === null（Copilot r2 C）：Boolean(baseURL && modelId)
+  // 会把纯空白串当 truthy —— 空白 baseURL + 有值 modelId 的形态会被误标
+  // configured、抑制提醒，而获取链路的 llmConfigError 会拒绝这种配置。
   const [llm, isOwner] = await Promise.all([
-    getLlmConfig(getAccountScopedSettings(accountId)),
+    resolveAgentModelConfig(getAccountScopedSettings(accountId)),
     resolveIsOwner(repository, accountId),
   ]);
 
@@ -118,9 +128,13 @@ export async function loadSettingsAttentionSummary(options?: {
   // 能对着一个从没探过的源(老用户在本次改动之前保存的)天天报假警。
   const searchSourceReachable = (pansouHealth?.trim() ?? "") !== "" ? pansouHealth!.trim() === "ok" : true;
   // update_available 只对站主存在（见 buildSettingsAttentionItems 的 isOwner
-  // 门控），所以非站主不该付这份代价：两次文件读 + 可能的 GitHub 探测，冷
-  // 缓存时最多要等满 5s 超时——而徽章每 8s 轮询一次。
-  const update = isOwner ? await loadDeploymentUpdateState() : null;
+  // 门控），所以非站主不该付这份代价。徽章每 8s 轮询：传 updaterStatus:false 跳过
+  // 更新助手往返，只问发布视图有没有更新的发行版。桌面也算——loadUpdateView 在桌面
+  // 走桌面发布源，有新安装包时同样给 available，徽章点进「更新」tab 下载。
+  const view = isOwner ? await loadUpdateView({ updaterStatus: false }) : null;
+  const availableUpdate = view?.available
+    ? { tag: view.available.tag, commit: view.available.commit, currentLabel: view.current.label }
+    : null;
 
   const items = buildSettingsAttentionItems({
     demo: false,
@@ -132,10 +146,9 @@ export async function loadSettingsAttentionSummary(options?: {
       status: drive.status,
     })),
     brandLabel,
-    llmConfigured: Boolean(llm.baseURL && llm.modelId),
+    llmConfigured: llmConfigError(llm) === null,
     searchSource: { custom: customSearchSource, reachable: searchSourceReachable },
-    update,
-    origin: options?.origin ?? DEFAULT_LOCAL_ORIGIN,
+    availableUpdate,
     ...(workspace.activeStorageId ? { activeStorageId: workspace.activeStorageId } : {}),
   });
 

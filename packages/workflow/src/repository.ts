@@ -1,11 +1,16 @@
 import {
   DEFAULT_ACCOUNT_ID,
+  buildCrossDriveEpisodeOwnership,
+  compareEpisodeCodes,
   isStagingJanitorId,
   isUserVisibleNotificationKind,
   isUserVisibleWorkflowKind,
   type AgentDecision,
   type BookLibraryEntry,
   type AgentStep,
+  type CrossDriveEpisodeOwnership,
+  type DriveSpaceCacheEntry,
+  type EpisodeCopy,
   type EpisodeState,
   type MediaTitle,
   type NotificationEvent,
@@ -59,6 +64,60 @@ import { normalizeScope, scopeMatches, type ScopeArg, type WorkflowScope } from 
  * so the SAME title can be tracked independently on multiple drives.
  */
 export const UNSCOPED_STORAGE = "__unscoped__";
+
+/** Which queued runs the worker may claim while others are running. */
+export interface QueuedRunDriveFilter {
+  /** Skip runs on these drives: they already have a run going. Never hides a run
+   *  with no bound drive (that one is excludeUnbound's job). */
+  excludeConnectedStorageIds?: readonly string[];
+  /** Skip runs with no bound drive: they land on their account's default drive,
+   *  which is not known here, so the worker only starts one when nothing else runs. */
+  excludeUnbound?: boolean;
+}
+
+/** How the worker claims when several queued runs may go side by side. */
+export interface QueueClaimOptions extends QueuedRunDriveFilter {
+  /** Told the claimed run and its drive right after the claim, before the run starts,
+   *  so the worker counts that drive as busy for its next claim. */
+  onClaimed?: (claimed: { workflowRunId: string; connectedStorageId: string | null }) => void;
+}
+
+/** claimNextQueuedWorkflowRun with the worker's claim options. Every queued runner
+ *  claims through this, so the options reach the repository whatever the kind. */
+export async function claimNextQueuedRun(
+  repository: Pick<WorkflowRepository, "claimNextQueuedWorkflowRun">,
+  kind: WorkflowKind,
+  now: string,
+  claim: QueueClaimOptions | undefined,
+): Promise<PersistedWorkflowRunSnapshot | null> {
+  const claimed = await repository.claimNextQueuedWorkflowRun({
+    kind,
+    now,
+    ...(claim?.excludeConnectedStorageIds === undefined ? {} : { excludeConnectedStorageIds: claim.excludeConnectedStorageIds }),
+    ...(claim?.excludeUnbound === undefined ? {} : { excludeUnbound: claim.excludeUnbound }),
+  });
+  if (claimed) {
+    claim?.onClaimed?.({ workflowRunId: claimed.workflowRun.id, connectedStorageId: claimed.connectedStorageId });
+  }
+  return claimed;
+}
+
+/** Whether `recordRunId` is run `runId` itself or one of its per-season records
+ *  (`${runId}_s${n}`, written by the series/replace/recovery runners). A queued run's
+ *  notifications ride on either. */
+export function isRunOrItsSeasonRecord(recordRunId: string, runId: string): boolean {
+  if (recordRunId === runId) return true;
+  const prefix = `${runId}_s`;
+  return recordRunId.startsWith(prefix) && /^\d+$/.test(recordRunId.slice(prefix.length));
+}
+
+/** Whether a queued run on `connectedStorageId` (null or the unscoped sentinel =
+ *  no bound drive) passes the worker's drive filter. */
+export function passesQueuedRunDriveFilter(connectedStorageId: string | null, filter: QueuedRunDriveFilter): boolean {
+  const drive = connectedStorageId === UNSCOPED_STORAGE ? null : connectedStorageId;
+  if (drive === null) return filter.excludeUnbound !== true;
+  return !(filter.excludeConnectedStorageIds ?? []).includes(drive);
+}
 
 /**
  * Composite key for per-(season, drive) episode buckets / lookups. A season's
@@ -202,8 +261,8 @@ export type WorkflowRunReservationResult =
 export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, UserRequestStore {
   saveBookEntry(entry: BookLibraryEntry): Promise<void>;
   queueBookEntry(entry: BookLibraryEntry): Promise<BookLibraryEntry>;
-  claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null>;
-  claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null>;
+  claimNextQueuedBookEntry(filter?: QueuedRunDriveFilter): Promise<BookLibraryEntry | null>;
+  claimNextPendingBookEntry(olderThan: string, filter?: QueuedRunDriveFilter): Promise<BookLibraryEntry | null>;
   recoverRunningBookEntries(): Promise<number>;
   deleteBookEntry(bookId: string, scope: WorkflowScope): Promise<boolean>;
   getBookEntry(bookId: string, scope: WorkflowScope): Promise<BookLibraryEntry | null>;
@@ -228,11 +287,12 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
   ): Promise<PersistedWorkflowRunSnapshot | null>;
   /** Cross-account: the single-instance worker drains every account's queue.
    *  The returned snapshot carries `accountId` so the worker can load that
-   *  account's credentials. */
+   *  account's credentials. The drive filter (see QueuedRunDriveFilter) lets the
+   *  worker run several queued runs side by side without two on one drive. */
   claimNextQueuedWorkflowRun(input: {
     kind: WorkflowKind;
     now: string;
-  }): Promise<PersistedWorkflowRunSnapshot | null>;
+  } & QueuedRunDriveFilter): Promise<PersistedWorkflowRunSnapshot | null>;
   /**
    * Crash recovery on worker start. Each `running` run takes ONE of three exits,
    * checked in this order — an implementer of a new backend must preserve it:
@@ -403,6 +463,19 @@ export interface WorkflowRepository extends DeadLinkStore, AgentMemoryStore, Use
   setAccountPassword(accountId: string, passwordHash: string): Promise<void>;
   /** Revoke an account's sessions (after reset/change); optionally keep one. */
   deleteSessionsForAccount(accountId: string, exceptSessionId?: string): Promise<void>;
+  /** Cache a drive's probed space numbers (`drive_space_cache`). */
+  upsertDriveSpaceCache?(entry: DriveSpaceCacheEntry): Promise<void>;
+  /** Read cached space for one drive, or null if never probed. */
+  getDriveSpaceCache?(storageId: string): Promise<DriveSpaceCacheEntry | null>;
+  /** Record or update physical episode copies landed on a drive (`episode_copies`, C8). */
+  upsertEpisodeCopies?(copies: readonly EpisodeCopy[]): Promise<void>;
+  /** List recorded episode copies for a tracked season (`episode_copies`, C8). */
+  listEpisodeCopies?(trackedSeasonId: string): Promise<EpisodeCopy[]>;
+  /** Cross-drive union of obtained episodes + drive ownership for a season (C9). */
+  obtainedEpisodesForSeason?(
+    trackedSeasonId: string,
+    accountId?: string,
+  ): Promise<CrossDriveEpisodeOwnership[]>;
   // recordDeadLink + listDeadLinkKeys come from DeadLinkStore.
 }
 
@@ -429,16 +502,16 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     return cloneWorkflowValue(entry);
   }
 
-  async claimNextQueuedBookEntry(): Promise<BookLibraryEntry | null> {
-    const entry = [...this.books.values()].filter((item) => item.status === "queued").sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+  async claimNextQueuedBookEntry(filter?: QueuedRunDriveFilter): Promise<BookLibraryEntry | null> {
+    const entry = [...this.books.values()].filter((item) => item.status === "queued" && !filter?.excludeConnectedStorageIds?.includes(item.connectedStorageId)).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
     if (!entry) return null;
     const claimed = { ...entry, status: "running" as const, updatedAt: new Date().toISOString() };
     await this.saveBookEntry(claimed);
     return cloneWorkflowValue(claimed);
   }
 
-  async claimNextPendingBookEntry(olderThan: string): Promise<BookLibraryEntry | null> {
-    const entry = [...this.books.values()].filter((item) => item.status === "pending" && item.updatedAt < olderThan).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
+  async claimNextPendingBookEntry(olderThan: string, filter?: QueuedRunDriveFilter): Promise<BookLibraryEntry | null> {
+    const entry = [...this.books.values()].filter((item) => item.status === "pending" && item.updatedAt < olderThan && !filter?.excludeConnectedStorageIds?.includes(item.connectedStorageId)).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))[0];
     if (!entry) return null;
     await this.saveBookEntry({ ...entry, pendingSince: entry.pendingSince ?? entry.updatedAt, updatedAt: new Date().toISOString() });
     return cloneWorkflowValue(entry);
@@ -467,9 +540,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   }
 
   async listBookEntries(scope: WorkflowScope): Promise<BookLibraryEntry[]> {
-    if (!scope.connectedStorageId) return [];
     return Array.from(this.books.values())
-      .filter((entry) => entry.accountId === scope.accountId && entry.connectedStorageId === scope.connectedStorageId)
+      .filter((entry) => entry.accountId === scope.accountId && (!scope.connectedStorageId || entry.connectedStorageId === scope.connectedStorageId))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .map(cloneWorkflowValue);
   }
@@ -487,6 +559,8 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   private readonly pendingReplacements = new Map<string, PendingReplacement>();
   private readonly rejectedResources: RejectedResource[] = [];
   private readonly episodeSources = new Map<string, EpisodeSource>();
+  private readonly driveSpaceCache = new Map<string, DriveSpaceCacheEntry>();
+  private readonly episodeCopies = new Map<string, EpisodeCopy>();
 
   async getSetting(key: string): Promise<string | null> {
     return this.settings.get(key) ?? null;
@@ -724,6 +798,73 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
         this.sessions.delete(id);
       }
     }
+  }
+
+  async upsertDriveSpaceCache(entry: DriveSpaceCacheEntry): Promise<void> {
+    if (!Number.isFinite(entry.totalBytes) || !Number.isFinite(entry.usedBytes)) return;
+    this.driveSpaceCache.set(entry.storageId, { ...entry });
+  }
+
+  async getDriveSpaceCache(storageId: string): Promise<DriveSpaceCacheEntry | null> {
+    const entry = this.driveSpaceCache.get(storageId);
+    return entry ? { ...entry } : null;
+  }
+
+  async upsertEpisodeCopies(copies: readonly EpisodeCopy[]): Promise<void> {
+    for (const copy of copies) {
+      const key = `${copy.trackedSeasonId}::${copy.episodeCode}::${copy.storageId}`;
+      this.episodeCopies.set(key, {
+        ...copy,
+        fileIds: [...copy.fileIds],
+        sizeBytes:
+          copy.sizeBytes !== null && Number.isFinite(copy.sizeBytes)
+            ? Math.trunc(copy.sizeBytes)
+            : null,
+      });
+    }
+  }
+
+  async listEpisodeCopies(trackedSeasonId: string): Promise<EpisodeCopy[]> {
+    return [...this.episodeCopies.values()]
+      .filter((c) => c.trackedSeasonId === trackedSeasonId)
+      .sort(
+        (a, b) =>
+          compareEpisodeCodes(a.episodeCode, b.episodeCode) ||
+          a.storageId.localeCompare(b.storageId),
+      )
+      .map((c) => ({ ...c, fileIds: [...c.fileIds] }));
+  }
+
+  async obtainedEpisodesForSeason(
+    trackedSeasonId: string,
+    accountId: string = DEFAULT_ACCOUNT_ID,
+  ): Promise<CrossDriveEpisodeOwnership[]> {
+    const copies = await this.listEpisodeCopies(trackedSeasonId);
+    const storages = new Set<string>();
+    for (const snapshot of this.workflowRuns.values()) {
+      if (
+        snapshot.season.id === trackedSeasonId &&
+        (snapshot.accountId ?? DEFAULT_ACCOUNT_ID) === accountId
+      ) {
+        storages.add(snapshot.connectedStorageId ?? UNSCOPED_STORAGE);
+      }
+    }
+    const ownedStorages = new Set(
+      (await this.listConnectedStorages(accountId)).map((s) => s.id),
+    );
+    for (const sid of storages) {
+      if (sid !== UNSCOPED_STORAGE) ownedStorages.add(sid);
+    }
+    const driveEpisodeBuckets = [...storages].map((storageId) => ({
+      storageId,
+      episodes: this.episodesBySeason.get(seasonScopeKey(trackedSeasonId, storageId)) ?? [],
+    }));
+    return buildCrossDriveEpisodeOwnership({
+      driveEpisodeBuckets,
+      copies,
+      ownedStorageIds: ownedStorages,
+      unscopedStorageSentinel: UNSCOPED_STORAGE,
+    });
   }
 
   async recordDeadLink(input: {
@@ -1205,9 +1346,14 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
   async claimNextQueuedWorkflowRun(input: {
     kind: WorkflowKind;
     now: string;
-  }): Promise<PersistedWorkflowRunSnapshot | null> {
+  } & QueuedRunDriveFilter): Promise<PersistedWorkflowRunSnapshot | null> {
     const queuedRun = Array.from(this.workflowRuns.values())
-      .filter((snapshot) => snapshot.workflowRun.kind === input.kind && snapshot.workflowRun.status === "queued")
+      .filter(
+        (snapshot) =>
+          snapshot.workflowRun.kind === input.kind &&
+          snapshot.workflowRun.status === "queued" &&
+          passesQueuedRunDriveFilter(snapshot.connectedStorageId ?? null, input),
+      )
       .sort((a, b) => a.workflowRun.startedAt.localeCompare(b.workflowRun.startedAt))[0];
     if (!queuedRun) {
       return null;
@@ -1671,7 +1817,16 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     const since = input?.since;
     const all = [...this.workflowRuns.values()]
       .filter((snapshot) => scopeMatches(scope, snapshot.accountId, snapshot.connectedStorageId))
-      .flatMap((snapshot) => snapshot.notifications.map((notification) => ({ ...notification })))
+      .flatMap((snapshot) =>
+        snapshot.notifications.map((notification) => ({
+          ...notification,
+          ...(notification.connectedStorageId === undefined &&
+          snapshot.connectedStorageId !== null &&
+          snapshot.connectedStorageId !== undefined
+            ? { connectedStorageId: snapshot.connectedStorageId }
+            : {}),
+        })),
+      )
       .filter((notification) => isUserVisibleNotificationKind(notification.kind))
       .filter((notification) => since === undefined || notification.createdAt >= since);
     all.sort((left, right) => right.createdAt.localeCompare(left.createdAt));

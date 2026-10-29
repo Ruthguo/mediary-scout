@@ -65,7 +65,7 @@ export async function searchBookLinks(query: string, accountId?: string): Promis
     userBaseURL: resolveUserPanSouBaseUrl(await settings.getSetting(PANSOU_BASE_URL_SETTING_KEY)),
     // Offline magnets are currently confirmed by VIDEO landing in the storage
     // executors; an ebook can be cancelled as a miss. Book transfer uses shares.
-    allowedTypes: ["115", "quark", "tianyi", "123", "guangya"],
+    allowedTypes: ["115", "quark", "uc", "tianyi", "123", "guangya"],
   });
   try {
     const snapshot = await provider.search({ keyword });

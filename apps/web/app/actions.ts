@@ -10,13 +10,13 @@ export async function requestBookAction(input: {
   storageId?: string | undefined;
 }): Promise<{ status: "saved" | "pending" | "unsupported" | "failed" | "no_coverage"; message: string }> {
   assertNotDemo();
-  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getActiveWorkspaceScope } = await import("../lib/workflow-runtime");
+  const { acquireLlmPreflightError, requireAuthenticatedAccountId, getWorkflowRepository, getBookWorkspaceScope } = await import("../lib/workflow-runtime");
   await requireAuthenticatedAccountId();
   const query = input.query.trim();
   if (!query || query.length > 120) {
     return { status: "unsupported", message: "搜索内容无效，请重新搜索。" };
   }
-  const scope = await getActiveWorkspaceScope(input.storageId);
+  const scope = await getBookWorkspaceScope(input.storageId);
   const repository = getWorkflowRepository();
   const previous = await repository.getBookEntry(input.bookId, scope);
   if (previous?.status === "saved") return { status: "saved", message: "这本书已入库。" };
@@ -35,9 +35,9 @@ export async function requestBookAction(input: {
 
 export async function untrackBookAction(input: { bookId: string; storageId?: string | undefined }): Promise<{ status: "untracked" | "not_found"; message: string }> {
   assertNotDemo();
-  const { requireAuthenticatedAccountId, getActiveWorkspaceScope, getWorkflowRepository } = await import("../lib/workflow-runtime");
+  const { requireAuthenticatedAccountId, getBookWorkspaceScope, getWorkflowRepository } = await import("../lib/workflow-runtime");
   await requireAuthenticatedAccountId();
-  const scope = await getActiveWorkspaceScope(input.storageId);
+  const scope = await getBookWorkspaceScope(input.storageId);
   const removed = await getWorkflowRepository().deleteBookEntry(input.bookId, scope);
   revalidatePath("/");
   return removed
@@ -46,14 +46,11 @@ export async function untrackBookAction(input: { bookId: string; storageId?: str
 }
 
 /**
- * Acquire-time LLM pre-check (issue #52). Returns a not-started result carrying
- * the friendly "未配置 AI 模型" message when a live (vercel-ai) acquisition can't
- * run for lack of LLM config — so the click does NOT enqueue a doomed run that
- * would only fail later in the worker (no wasted spin, no failed card in 活动).
- * Returns null when an LLM is configured (common case → unchanged behavior) or on
- * the fake/demo adapter (never needs an LLM → never blocked). Shared by every
- * acquire entry point. Resolves config the SAME way the worker does
- * (account-scoped DB → env), via acquireLlmPreflightError.
+ * Acquire-time LLM pre-check (issue #52) — NARROWED with the shipped free preset:
+ * 零配置时 resolveAgentModelConfig 回落 FREE_LLM_PRESET，不再拦截（开箱即用）；
+ * acquireLlmPreflightError 只拦半截配置（baseURL/modelId 一空一非空）——那种
+ * run 入队后会在 claim 前死于 llmConfigError 且无人收尸（ghost run），所以在
+ * 点击时用同一条文案友好拦下（详见其注释）。
  */
 async function acquireLlmNotConfigured(): Promise<RequestTrackingActionResult | null> {
   const { getCurrentAccountId, acquireLlmPreflightError } = await import("../lib/workflow-runtime");
@@ -132,12 +129,28 @@ export interface ConnectQuarkActionResult {
 
 /** Settings "添加网盘 → 夸克": bind a pasted 夸克 cookie as a new drive. */
 export async function connectQuarkAction(cookie: string): Promise<ConnectQuarkActionResult> {
+  return connectCloudFamilyCookieAction(cookie, "quark");
+}
+
+/** Settings "添加网盘 → UC网盘": bind a pasted UC cookie as a new drive. Same
+ *  family protocol as 夸克, so it reuses the whole connect/probe/provision path. */
+export async function connectUcAction(cookie: string): Promise<ConnectQuarkActionResult> {
+  return connectCloudFamilyCookieAction(cookie, "uc");
+}
+
+/** Shared body for the 阿里云盘族 (夸克 / UC) cookie actions — the two differ only
+ *  in which runtime function runs and the label in the success message. */
+async function connectCloudFamilyCookieAction(
+  cookie: string,
+  provider: "quark" | "uc",
+): Promise<ConnectQuarkActionResult> {
   assertNotDemo();
+  const label = provider === "uc" ? "UC网盘" : "夸克网盘";
   try {
-    const { connectQuarkCookie } = await import("../lib/workflow-runtime");
-    const { providerUid } = await connectQuarkCookie(cookie);
+    const { connectQuarkCookie, connectUcCookie } = await import("../lib/workflow-runtime");
+    const { providerUid } = await (provider === "uc" ? connectUcCookie(cookie) : connectQuarkCookie(cookie));
     revalidatePath("/settings");
-    return { ok: true, message: `夸克网盘已连接（账号 ${providerUid.slice(0, 10)}…）。` };
+    return { ok: true, message: `${label}已连接（账号 ${providerUid.slice(0, 10)}…）。` };
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }
@@ -334,8 +347,15 @@ export async function importForeignWorkAction(input: {
   if (input.providerFileIds.length === 0) {
     return { status: "failed", message: "没有可入库的文件。" };
   }
+  const { importForeignWorkFiles, isUpdateInProgress, UpdateInProgressError } = await import("../lib/workflow-runtime");
+  // A container swap mid-import leaves a half-moved folder the retry can't finish. Refuse
+  // upfront while the updater holds new work; importForeignWorkFiles rechecks the hold once
+  // it is counted in flight and throws UpdateInProgressError if the hold was taken in the
+  // gap between here and there, so the swap handshake cannot win that race.
+  if (isUpdateInProgress()) {
+    return { status: "failed", message: "正在更新，更新完成后再入库。" };
+  }
   try {
-    const { importForeignWorkFiles } = await import("../lib/workflow-runtime");
     await importForeignWorkFiles({
       providerFileIds: input.providerFileIds,
       movieTitle,
@@ -347,6 +367,9 @@ export async function importForeignWorkAction(input: {
       message: `已入库到 ${movieTitle} (${year})。`,
     };
   } catch (error) {
+    if (error instanceof UpdateInProgressError) {
+      return { status: "failed", message: "正在更新，更新完成后再入库。" };
+    }
     return { status: "failed", message: `入库失败：${String(error)}` };
   }
 }
@@ -542,6 +565,9 @@ export async function runPatrolNowAction(): Promise<PushSettingsActionResult & {
   try {
     const { runScheduledType3 } = await import("../lib/workflow-runtime");
     const result = await runScheduledType3({ force: true });
+    if (result.skipped === "update_in_progress") {
+      return { success: false, message: "正在更新，更新完成后再巡检。" };
+    }
     return { success: true, checked: result.outcomes.length };
   } catch (error) {
     return { success: false, message: `巡检失败：${String(error)}` };
@@ -600,8 +626,17 @@ export async function saveLlmConfigAction(input: {
     // Normalize base URL (the provider appends /chat/completions itself) and
     // strip all whitespace/invisible chars from the key — paste contamination
     // would otherwise silently store a wrong value (大误会).
-    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, normalizeLlmBaseUrl(input.baseURL));
-    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, input.modelId.trim());
+    const baseURL = normalizeLlmBaseUrl(input.baseURL);
+    // 清空服务地址 = 放弃自定义配置：没有 baseURL 的 modelId 无意义，留着只会
+    // 制造半截行 —— resolveAgentModelConfig 对「url/model 双空」回落出厂免费预设
+    // （apiKey 不参与判定，见其注释），半截配置照原样返回、下游 llmConfigError
+    // fail-fast。所以 baseURL 为空时把 modelId 一并写空（整行清空 → 解析层回落
+    // Kilo 免费池，残留 key 也会被回落分支丢弃），让设置页「清空地址保存即恢复
+    // 默认」的文案为真（免费态表单预填预设值，用户通常只清地址）。baseURL 非空
+    // 时行为不变：modelId 照用户输入（trim）存。API Key 语义不动（blank-keep，
+    // 见下）。
+    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, baseURL);
+    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, baseURL ? input.modelId.trim() : "");
     // Only overwrite the key when the user actually typed a new one — a blank
     // submit keeps the stored key (the form never echoes it back).
     const apiKey = sanitizeLlmApiKey(input.apiKey);
@@ -614,6 +649,59 @@ export async function saveLlmConfigAction(input: {
   }
 }
 
+/** 一键换回出厂免费模型：把 FREE_LLM_PRESET 写进本账号 settings（与
+ *  saveLlmConfigAction 同一落点），让生效配置立即回到出厂免费档。已存的
+ *  API Key 不动 —— 免费池无 key 直连用不到它，用户以后再换成自己的服务时
+ *  key 还在（与 saveLlmConfigAction 的 blank-keep 语义一致）。 */
+export async function restoreFreeLlmAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  // 覆盖前记旧值，用于失败时的补偿回滚：两次 setSetting（baseURL、modelId）之间
+  // 若第二次失败，baseURL 已是 Kilo、modelId 仍旧值 —— 持续生效的混合配置，用户
+  // 不重试就不会自愈。选补偿回滚而非 repository 事务：现有 repository 只有逐 key
+  // setSetting，为这相邻两次写加批量事务 API 超出本 PR 范围；两次写之间失败概率
+  // 极低，回滚已把后果从「持续混合配置」降为「无变化」。undefined = 连旧值都没
+  // 读到（import/账号解析就失败，第一写从未发生）→ 没有可回滚的状态，别乱写库。
+  let previousBaseUrl: string | null | undefined;
+  try {
+    const { FREE_LLM_PRESET, normalizeLlmBaseUrl } = await import("@media-track/workflow");
+    const { getWorkflowRepository, getCurrentAccountId, LLM_BASE_URL_SETTING_KEY, LLM_MODEL_ID_SETTING_KEY } =
+      await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    previousBaseUrl = await repository.getAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY);
+    // baseURL 走与 saveLlmConfigAction 相同的 normalize，保证写库值与
+    // resolveAgentModelConfig 回落形态逐字一致（isFreeLlmPreset 按此比较）。
+    await repository.setAccountSetting(accountId, LLM_BASE_URL_SETTING_KEY, normalizeLlmBaseUrl(FREE_LLM_PRESET.baseURL));
+    await repository.setAccountSetting(accountId, LLM_MODEL_ID_SETTING_KEY, FREE_LLM_PRESET.modelId);
+    return { success: true };
+  } catch (error) {
+    // 第一写之后失败 → best-effort 把 baseURL 写回旧值。旧值为 null（从未配置）
+    // 时写空串：getLlmConfig 把空串归一为 undefined，与 null 等价（saveLlmConfigAction
+    // 的「整行清空」同一语义）。回滚自身失败只进日志，绝不掩盖/替换原始错误。
+    if (previousBaseUrl !== undefined) {
+      try {
+        const { getWorkflowRepository, getCurrentAccountId, LLM_BASE_URL_SETTING_KEY } = await import(
+          "../lib/workflow-runtime"
+        );
+        await getWorkflowRepository().setAccountSetting(
+          await getCurrentAccountId(),
+          LLM_BASE_URL_SETTING_KEY,
+          previousBaseUrl ?? "",
+        );
+      } catch (rollbackError) {
+        console.error(
+          `[restore-free-llm-action] rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    // 内部细节（DB 报错、堆栈、路径）不回传浏览器 —— 与 web 端 runAction 的
+    // 泛化错误边界同一思路（那边也是刻意丢掉异常只给固定文案）。原始错误进
+    // 服务端日志供排查。
+    console.error(`[restore-free-llm-action] failed: ${error instanceof Error ? error.message : String(error)}`);
+    return { success: false, message: "换回失败，请稍后重试" };
+  }
+}
+
 export async function testLlmConnectionAction(): Promise<{ ok: boolean; message: string }> {
   try {
     assertNotDemo();
@@ -621,7 +709,7 @@ export async function testLlmConnectionAction(): Promise<{ ok: boolean; message:
       "../lib/workflow-runtime"
     );
     const accountId = await getCurrentAccountId();
-    // Resolve EXACTLY as the worker does (account-scoped → env). No default endpoint.
+    // Resolve EXACTLY as the worker does (account-scoped → env → 出厂免费预设回落).
     const cfg = await resolveAgentModelConfig(getAccountScopedSettings(accountId));
     const { createAgentModel, llmConfigError } = await import("@media-track/workflow");
     // BYO + agnostic: baseURL + 模型 are required; API Key is optional (keyless
@@ -764,6 +852,47 @@ export async function clearProwlarrConfigAction(): Promise<PushSettingsActionRes
     const accountId = await getCurrentAccountId();
     await repository.setAccountSetting(accountId, PROWLARR_BASE_URL_SETTING_KEY, "");
     await repository.setAccountSetting(accountId, PROWLARR_API_KEY_SETTING_KEY, "");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+/** 海搜官方 API（idatariver 项目 b9d1）。保存前先真打一次搜索，把
+ *  「key 无效 / 没余额」在保存这一刻就告诉用户 —— 否则它会一路静默成
+ *  「这个源没结果」，用户永远查不到原因。 */
+export async function saveHaisouConfigAction(input: {
+  apiKey: string;
+}): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  const apiKey = input.apiKey.trim();
+  if (!apiKey) {
+    return { success: false, message: "请填入 API Key" };
+  }
+  try {
+    const { HaisouResourceProvider } = await import("@media-track/workflow");
+    const probe = new HaisouResourceProvider({ apiKey });
+    const snapshot = await probe.search({ keyword: "沙丘" });
+    if (snapshot.sourceHealth && snapshot.sourceHealth.status !== "healthy") {
+      return { success: false, message: "API Key 无效或额度不足（上游返回失败码）" };
+    }
+    const { getWorkflowRepository, getCurrentAccountId, HAISOU_API_KEY_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    await getWorkflowRepository().setAccountSetting(await getCurrentAccountId(), HAISOU_API_KEY_SETTING_KEY, apiKey);
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearHaisouConfigAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, getCurrentAccountId, HAISOU_API_KEY_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    await getWorkflowRepository().setAccountSetting(await getCurrentAccountId(), HAISOU_API_KEY_SETTING_KEY, "");
     return { success: true };
   } catch (error) {
     return { success: false, message: `清除失败：${String(error)}` };
@@ -1026,8 +1155,8 @@ export async function testRemoteAccessConnectionAction(): Promise<TestRemoteAcce
   // demo gate:与其它 settings action 一致(Copilot round 1)。
   // demo 站没有真实隧道,探测只会做无意义的跨网请求。
   assertNotDemo();
-  const { instanceConnectHostname } = await import("../lib/remote-access");
-  const hostname = instanceConnectHostname();
+  const { resolveInstanceConnectHostname } = await import("../lib/remote-access");
+  const hostname = await resolveInstanceConnectHostname();
   if (hostname === null) {
     return { ok: false, detail: "no_hostname" };
   }

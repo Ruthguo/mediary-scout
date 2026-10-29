@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV3 } from "ai/test";
 import {
   createEpisodeStates,
@@ -195,6 +195,34 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(saved?.workflowRun.kind).toBe("type3_monitor");
   });
 
+  it("reserves nothing once mayStartRun says no, even if it said yes when the sweep began", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture();
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01", "S01E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    // The hold is taken while the sweep is still setting up: only the check right
+    // before the reservation sees it.
+    let calls = 0;
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: noCoverageModel(),
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_held_patrol",
+      mayStartRun: () => {
+        calls += 1;
+        return false;
+      },
+    });
+
+    expect(calls).toBeGreaterThan(0);
+    expect(outcomes).toEqual([{ trackedSeasonId: season.id, status: "skipped_active" }]);
+    expect(await repository.getWorkflowRunSnapshot("run_held_patrol")).toBeNull();
+  });
+
   it("persists staging_leaked on the FAILED type3 run when the agent dies and the staging dir survives cleanup", async () => {
     // The patrol's inline catch builds the failed run's audit events by hand; a
     // leak carried on the error must land there too (Copilot #260 r1).
@@ -253,6 +281,86 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     const saved = await repository.getWorkflowRunSnapshot("run_sync_type3");
     // The sync refreshed the season's aired cursor so E03/E04 became the need.
     expect(saved?.season.latestAiredEpisode).toBe(4);
+  });
+
+  it("heals an inflated season before patrol and never invokes the agent", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title } = trackedFixture("inflated");
+    const season: TrackedSeason = {
+      ...trackedFixture("inflated").season,
+      id: `${title.id}_s1`,
+      mediaTitleId: title.id,
+      totalEpisodes: 14,
+      latestAiredEpisode: 14,
+    };
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: throwingModel(),
+      storageParentDirectoryId: "library_root",
+      now: () => "2026-06-12T00:00:01.000Z",
+      createWorkflowRunId: () => "run_heal_type3",
+      syncSeasonMetadata: async () => ({ latestAiredEpisode: 1, totalEpisodes: 14 }),
+    });
+
+    expect(outcomes).toEqual([
+      { trackedSeasonId: season.id, status: "ran", workflowRunId: "run_heal_type3", workflowStatus: "succeeded" },
+    ]);
+    const saved = await repository.getWorkflowRunSnapshot("run_heal_type3");
+    expect(saved?.season.latestAiredEpisode).toBe(1);
+    const persisted = (await repository.listAllTrackedSeasonStates()).find((state) => state.season.id === season.id);
+    expect(persisted?.season.latestAiredEpisode).toBe(1);
+    expect(persisted?.episodes.find((episode) => episode.episodeCode === "S01E02")).toMatchObject({
+      airStatus: "unaired",
+      obtained: false,
+    });
+    const patrol = (await repository.listNotifications()).find(
+      (notification) => notification.workflowRunId === "run_heal_type3",
+    );
+    expect(patrol?.kind).toBe("already_current");
+  });
+
+  it("warns when metadata sync fails and continues with the stored counts", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title } = trackedFixture("sync-error");
+    const season: TrackedSeason = {
+      ...trackedFixture("sync-error").season,
+      totalEpisodes: 4,
+      latestAiredEpisode: 2,
+    };
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01", "S01E02"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01", "S01E02"]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const outcomes = await runScheduledType3Monitoring({
+        repository,
+        resourceProvider: emptyProvider(),
+        storage,
+        model: throwingModel(),
+        storageParentDirectoryId: "library_root",
+        now: fixedNow,
+        createWorkflowRunId: () => "run_sync_error_type3",
+        syncSeasonMetadata: async () => {
+          throw new Error("TMDB metadata unavailable");
+        },
+      });
+
+      expect(outcomes[0]).toMatchObject({ status: "ran", workflowRunId: "run_sync_error_type3" });
+      const saved = await repository.getWorkflowRunSnapshot("run_sync_error_type3");
+      expect(saved?.season).toMatchObject({ totalEpisodes: 4, latestAiredEpisode: 2 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("tmdbId=1"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("season=1"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("TMDB metadata unavailable"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("records a no-op run when a tracked season is already current — the agent model is never invoked", async () => {
@@ -474,6 +582,25 @@ describe("runScheduledType3Monitoring (V2 engine)", () => {
     expect(outcomes[0]).toMatchObject({ trackedSeasonId: `${movie.id}_movie`, status: "ran", workflowRunId: "run_movie_patrol" });
     const saved = await repository.getWorkflowRunSnapshot("run_movie_patrol");
     expect(saved?.workflowRun.kind).toBe("movie_init");
+    // Like the shows it patrols, the film reports into the daily digest instead of
+    // pushing on its own every sweep, and still reads as not found (not 已是最新).
+    expect(saved?.notifications.map((notification) => [notification.kind, notification.trigger])).toEqual([
+      ["no_coverage", "scheduled"],
+    ]);
+
+    const held = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage: new FakeStorageExecutor(),
+      model: noCoverageModel(),
+      storageParentDirectoryId: "tv_root",
+      moviesParentDirectoryId: "movies_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_movie_held",
+      mayStartRun: () => false,
+    });
+    expect(held).toEqual([{ trackedSeasonId: `${movie.id}_movie`, status: "skipped_active" }]);
+    expect(await repository.getWorkflowRunSnapshot("run_movie_held")).toBeNull();
   });
 
   it("a movie patrol is skipped_active when a replace_request for the film is reserved after the sweep's filter", async () => {
@@ -1304,6 +1431,169 @@ describe("runScheduledType3Monitoring — user requests", () => {
   });
 });
 
+describe("runScheduledType3Monitoring — transient retry & failure logging", () => {
+  it("retries once in-patrol when a season patrol hits a transient free-preset LLM 503 error and succeeds on attempt 2", async () => {
+    const { FREE_LLM_PRESET } = await import("../src/agent-model.js");
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture("retry_tv");
+    // E02 is missing so the agent actually runs.
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+
+    let attempts = 0;
+    const flakyModel = new MockLanguageModelV3({
+      doGenerate: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw Object.assign(new Error("Upstream error from Nvidia: Service temporarily overloaded"), {
+            statusCode: 503,
+          });
+        }
+        if (attempts === 2) {
+          return {
+            content: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "c1",
+                toolName: "searchResources",
+                input: JSON.stringify({ keyword: "Show retry_tv" }),
+              },
+            ],
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        if (attempts === 3) {
+          return {
+            content: [
+              {
+                type: "tool-call" as const,
+                toolCallId: "c2",
+                toolName: "reportNoCoverage",
+                input: JSON.stringify({ reason: "still missing" }),
+              },
+            ],
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" as const },
+            usage: USAGE,
+            warnings: [],
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: "done" }],
+          finishReason: { unified: "stop" as const, raw: "stop" as const },
+          usage: USAGE,
+          warnings: [],
+        };
+      },
+    });
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model: flakyModel,
+      llmConfig: FREE_LLM_PRESET,
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_patrol_retry_ok",
+    });
+
+    expect(attempts).toBeGreaterThanOrEqual(3);
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        trackedSeasonId: season.id,
+        status: "ran",
+        workflowRunId: "run_patrol_retry_ok",
+      }),
+    ]);
+    const saved = await repository.getWorkflowRunSnapshot("run_patrol_retry_ok");
+    expect(saved?.workflowRun.status).not.toBe("failed");
+  });
+
+  it("logs [workflow] run <id> type3_monitor failed when a patrol run terminally fails", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture("log_fail");
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    try {
+      const outcomes = await runScheduledType3Monitoring({
+        repository,
+        resourceProvider: emptyProvider(),
+        storage,
+        model: throwingModel(),
+        storageParentDirectoryId: "library_root",
+        now: fixedNow,
+        createWorkflowRunId: () => "run_patrol_log_fail",
+      });
+
+      expect(outcomes).toEqual([
+        {
+          trackedSeasonId: season.id,
+          status: "failed",
+          workflowRunId: "run_patrol_log_fail",
+          errorMessage: "agent model unavailable",
+        },
+      ]);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[workflow] run run_patrol_log_fail type3_monitor failed"),
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("does NOT replay a patrol run when the first attempt preserved unmoved staging files or already attempted a transfer", async () => {
+    const { FREE_LLM_PRESET } = await import("../src/agent-model.js");
+    const { attachStagingKeptUnmoved } = await import("../src/acquisition-v2/directory-lifecycle.js");
+    const repository = new InMemoryWorkflowRepository();
+    const { title, season } = trackedFixture("no_replay_kept");
+    await seedTrackedSeason({ repository, title, season, obtainedCodes: ["S01E01"] });
+    const storage = new FakeStorageExecutor();
+    await seedV2Season(storage, title, season, ["S01E01"]);
+
+    let attempts = 0;
+    const model = new MockLanguageModelV3({
+      doGenerate: async () => {
+        attempts += 1;
+        const err = Object.assign(new Error("Upstream error from Nvidia: Service temporarily overloaded"), {
+          statusCode: 503,
+        });
+        throw attachStagingKeptUnmoved(err, [
+          { stagingDirectoryId: "stg-1", showDirectoryId: "show-1", fileCount: 2 },
+        ]);
+      },
+    });
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository,
+      resourceProvider: emptyProvider(),
+      storage,
+      model,
+      llmConfig: FREE_LLM_PRESET,
+      storageParentDirectoryId: "library_root",
+      now: fixedNow,
+      createWorkflowRunId: () => "run_no_replay_kept",
+    });
+
+    expect(attempts).toBe(1);
+    expect(outcomes).toEqual([
+      expect.objectContaining({
+        trackedSeasonId: season.id,
+        status: "failed",
+        workflowRunId: "run_no_replay_kept",
+      }),
+    ]);
+    const saved = await repository.getWorkflowRunSnapshot("run_no_replay_kept");
+    expect(saved?.workflowRun.auditEvents.some((e) => e.type === "staging_kept_unmoved_files")).toBe(true);
+  });
+});
+
+
 describe("runScheduledType3Monitoring — the user's rejected list applies to ordinary runs", () => {
   const ACCOUNT = "acct_default";
   const OLD_TITLE = "Show show S01E02 [OldGroup] [1.3G]";
@@ -1451,5 +1741,129 @@ describe("runScheduledType3Monitoring — the user's rejected list applies to or
     expect(outcomes).toEqual([expect.objectContaining({ status: "ran" })]);
     expect((await repository.getWorkflowRunSnapshot("run_rejected_down"))?.workflowRun.status).not.toBe("failed");
     expect(doc).toContain("OldGroup");
+  });
+});
+
+/**
+ * A frozen drive's login is dead (re-bind to recover): nothing the patrol could do on it
+ * would work. 2026-09-30 production: a kicked-off 123 login froze its drive, and the 06:00
+ * patrol still reserved a run per show on it — four runs, each failing on the dead login.
+ */
+describe("runScheduledType3Monitoring — frozen drives", () => {
+  async function bindDrive(repository: InMemoryWorkflowRepository, id: string, status: "active" | "frozen") {
+    await repository.upsertConnectedStorage({
+      id,
+      accountId: "acct_default",
+      provider: "pan123",
+      providerUid: id,
+      payload: {},
+      createdAt: fixedNow(),
+    });
+    if (status === "frozen") {
+      await repository.setConnectedStorageStatus(id, "frozen", "PAN123_AUTH_FAILED: 未登录", fixedNow());
+    }
+  }
+
+  /** A show with E02 missing, bound to `drive` (null = unbound: it lands on the account's default drive). */
+  async function gappedShow(
+    repository: InMemoryWorkflowRepository,
+    storage: FakeStorageExecutor,
+    suffix: string,
+    drive: string | null,
+  ) {
+    const { title, season } = trackedFixture(suffix);
+    await repository.saveWorkflowRunSnapshot({
+      ...(drive === null ? {} : { connectedStorageId: drive }),
+      title,
+      season,
+      workflowRun: {
+        id: `seed_${season.id}`,
+        kind: "type2_init",
+        status: "succeeded",
+        trackedSeasonId: season.id,
+        startedAt: fixedNow(),
+        finishedAt: fixedNow(),
+        auditEvents: [],
+      },
+      episodes: createEpisodeStates({ trackedSeasonId: season.id, seasonNumber: 1, totalEpisodes: 2, latestAiredEpisode: 2 }),
+      resourceSnapshots: [],
+      decisions: [],
+      transferAttempts: [],
+      notifications: [],
+    });
+    await seedV2Season(storage, title, season, ["S01E01"]);
+    return season;
+  }
+
+  it("does not patrol a show whose drive is frozen; a show on a working drive still runs", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const storage = new FakeStorageExecutor();
+    await bindDrive(repository, "drive_live", "active");
+    await bindDrive(repository, "drive_dead", "frozen");
+    const live = await gappedShow(repository, storage, "live", "drive_live");
+    const dead = await gappedShow(repository, storage, "dead", "drive_dead");
+    let reserved = 0;
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository, resourceProvider: emptyProvider(), storage, model: noCoverageModel(),
+      storageParentDirectoryId: "library_root", now: fixedNow,
+      createWorkflowRunId: () => `run_frozen_${(reserved += 1)}`,
+    });
+
+    expect(outcomes.map((o) => o.trackedSeasonId)).toEqual([live.id]);
+    expect(outcomes.some((o) => o.trackedSeasonId === dead.id)).toBe(false);
+    expect(reserved).toBe(1);
+  });
+
+  it("does not patrol an unbound show when its account's default drive is frozen", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const storage = new FakeStorageExecutor();
+    await bindDrive(repository, "drive_dead", "frozen");
+    await gappedShow(repository, storage, "unbound", null);
+    let reserved = 0;
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository, resourceProvider: emptyProvider(), storage, model: throwingModel(),
+      storageParentDirectoryId: "library_root", now: fixedNow,
+      createWorkflowRunId: () => `run_unbound_${(reserved += 1)}`,
+      resolveDriveId: async () => "drive_dead",
+    });
+
+    expect(outcomes).toEqual([]);
+    expect(reserved).toBe(0);
+  });
+
+  it("a message on a frozen drive's show queues nothing: it stays pending until the drive is re-bound", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const storage = new FakeStorageExecutor();
+    await bindDrive(repository, "drive_dead", "frozen");
+    await gappedShow(repository, storage, "msg", "drive_dead");
+    const work = { accountId: "acct_default", drive: "drive_dead", titleKey: "title_msg" };
+    await repository.createUserMessage({ ...work, body: "第 1 集发蓝", episodeTags: ["S01E01"], now: fixedNow() });
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository, resourceProvider: emptyProvider(), storage, model: throwingModel(),
+      storageParentDirectoryId: "library_root", now: fixedNow,
+    });
+
+    expect(outcomes).toEqual([]);
+    expect(await repository.listActiveWorkflowRuns({ accountId: "acct_default", connectedStorageId: "drive_dead" })).toEqual([]);
+    expect((await repository.listUserMessages(work))[0]?.status).toBe("pending");
+  });
+
+  it("once the drive is re-bound (active again) its shows are patrolled as before", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    const storage = new FakeStorageExecutor();
+    await bindDrive(repository, "drive_back", "frozen");
+    await repository.setConnectedStorageStatus("drive_back", "active", null, null);
+    const back = await gappedShow(repository, storage, "back", "drive_back");
+
+    const outcomes = await runScheduledType3Monitoring({
+      repository, resourceProvider: emptyProvider(), storage, model: noCoverageModel(),
+      storageParentDirectoryId: "library_root", now: fixedNow,
+      createWorkflowRunId: () => "run_back",
+    });
+
+    expect(outcomes).toEqual([expect.objectContaining({ trackedSeasonId: back.id, status: "ran" })]);
   });
 });

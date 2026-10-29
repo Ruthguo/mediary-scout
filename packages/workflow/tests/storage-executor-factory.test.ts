@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createExecutorForBrand,
   QuarkStorageExecutor,
   Storage115Executor,
+  STORAGE_BRANDS,
 } from "../src/index.js";
 import { GuangYaStorageExecutor } from "../src/guangya-storage-executor.js";
 import { Pan123StorageExecutor } from "../src/pan123-storage-executor.js";
@@ -18,6 +19,15 @@ describe("createExecutorForBrand", () => {
   it("quark → QuarkStorageExecutor", () => {
     const exec = createExecutorForBrand({ provider: "quark", cookie: "__uid=1", scopeCids: ["ROOT"] });
     expect(exec).toBeInstanceOf(QuarkStorageExecutor);
+  });
+
+  it("uc → QuarkStorageExecutor bound to the UC profile (not the 夸克 one)", () => {
+    const exec = createExecutorForBrand({ provider: "uc", cookie: "__uid=uc1", scopeCids: ["ROOT"] });
+    expect(exec).toBeInstanceOf(QuarkStorageExecutor);
+    // Same class, different family member: the profile decides host/query/UA and
+    // the fail-loud error codes. Losing it would silently talk to drive-pc.quark.cn
+    // with a UC cookie.
+    expect((exec as unknown as { profile: { key: string } }).profile.key).toBe("uc");
   });
 
   it("guangya → GuangYaStorageExecutor (from a token credential blob, no cookie)", () => {
@@ -96,4 +106,42 @@ describe("createExecutorForBrand", () => {
       /unknown storage brand/i,
     );
   });
+});
+
+describe("STORAGE_BRANDS writeScope", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // A staging recovery walks down from the category dirs only on "listed" drives. A brand
+  // marked "parents" whose executor really checks listings would refuse every recovery
+  // write (2026-09-30 production), so the registry value is checked against the executor.
+  for (const brand of STORAGE_BRANDS) {
+    it(`${brand.provider} (${brand.writeScope}): the executor checks writes the way the registry says`, async () => {
+      const fetchMock = vi.fn(async () => {
+        throw new Error("offline (test)");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const executor = createExecutorForBrand({
+        provider: brand.provider,
+        cookie: "UID=1_A1_2;CID=2;SEID=3;__uid=1",
+        credential: { token: "TK", accessToken: "AT", refreshToken: "RT", sessionKey: "SK" },
+        scopeCids: ["scope-root"],
+        env: {},
+      });
+      const error: unknown = await executor.removeDirectory("never-listed").then(
+        () => null,
+        (rejected: unknown) => rejected,
+      );
+      expect(error).not.toBeNull();
+      if (brand.writeScope === "listed") {
+        // Refused from what this executor has listed, without asking the drive.
+        expect(String(error)).toMatch(/WRITE_SCOPE_VIOLATION/);
+        expect(fetchMock).not.toHaveBeenCalled();
+      } else {
+        // Looked the directory up on the drive before deciding.
+        expect(fetchMock).toHaveBeenCalled();
+      }
+    });
+  }
 });

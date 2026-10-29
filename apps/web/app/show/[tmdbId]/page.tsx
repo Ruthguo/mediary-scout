@@ -2,7 +2,7 @@ import Link from "next/link";
 import { connection } from "next/server";
 import { Suspense, cache, type ReactNode } from "react";
 import { TriangleAlert } from "lucide-react";
-import { isMovieUnreleased, type EpisodeDisplayState } from "@media-track/workflow";
+import { formatByteSize, isMovieUnreleased, type EpisodeDisplayState } from "@media-track/workflow";
 import { AcquiringPoller } from "../../../components/acquiring-poller";
 import { AcquisitionLockProvider } from "../../../components/acquisition-lock";
 import { AppSidebar } from "../../../components/app-sidebar";
@@ -318,7 +318,23 @@ function MovieHub({
   const unreleased =
     view.state === "untracked" && isMovieUnreleased(view.releaseDate, nowIso);
   const movieCandidateId = `tmdb_movie_${view.tmdbId}`;
+  const firstDrive = view.driveBadges?.[0];
+  const movieBadgeLabel =
+    view.state === "acquired" && firstDrive ? `${meta.label} · ${firstDrive.label}` : meta.label;
   const chips: Array<{ label: string; value: string }> = [];
+  if (view.driveBadges && view.driveBadges.length > 0) {
+    chips.push({
+      label: "网盘",
+      value: view.driveBadges.map((d) => d.label).join(" / "),
+    });
+    const firstWithSize = view.driveBadges.find((d) => d.sizeBytes !== null && d.sizeBytes > 0);
+    if (firstWithSize && firstWithSize.sizeBytes !== null) {
+      chips.push({
+        label: "体积",
+        value: formatByteSize(firstWithSize.sizeBytes),
+      });
+    }
+  }
   if (view.releaseDate) chips.push({ label: "上映", value: formatMovieDate(view.releaseDate) });
   if (view.originalTitle && view.originalTitle !== view.title) {
     chips.push({ label: "原名", value: view.originalTitle });
@@ -351,7 +367,7 @@ function MovieHub({
             </div>
             <div className="hub-title-block">
               <div className="hub-badges">
-                <span className={`hub-badge tone-${meta.tone}`}>{meta.label}</span>
+                <span className={`hub-badge tone-${meta.tone}`}>{movieBadgeLabel}</span>
                 {view.state !== "untracked" ? (
                   <SwapBadge tmdbId={view.tmdbId} mediaType="movie" storageId={storageId} />
                 ) : null}
@@ -524,12 +540,29 @@ function SeasonRow({
         <div className="episode-grid hub-episode-grid">
           {season.episodes.map((episode) => {
             const stateClass = episode.displayState.replace("_", "-");
-            const stateLabel = EPISODE_STATE_LABEL[episode.displayState];
+            const baseLabel = EPISODE_STATE_LABEL[episode.displayState];
+            const firstDrive = episode.driveBadges?.[0];
+            const stateLabel =
+              episode.obtained && firstDrive ? `${baseLabel} · ${firstDrive.label}` : baseLabel;
+            const tooltip =
+              episode.obtained && episode.driveBadges && episode.driveBadges.length > 0
+                ? episode.driveBadges
+                    .map((d) =>
+                      [
+                        d.label,
+                        d.quality ?? null,
+                        d.sizeBytes !== null && d.sizeBytes > 0 ? formatByteSize(d.sizeBytes) : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · "),
+                    )
+                    .join(" / ")
+                : undefined;
             // A 待换 cell is a client piece: 「不换了」 on the message card restores it at once.
             return swap.has(episode.episodeCode) ? (
               <SwapEpisodeCell key={episode.episodeCode} code={episode.episodeCode} stateClass={stateClass} stateLabel={stateLabel} />
             ) : (
-              <div className={`episode-cell ${stateClass}`} key={episode.episodeCode}>
+              <div className={`episode-cell ${stateClass}`} key={episode.episodeCode} title={tooltip}>
                 <strong>{episode.episodeCode.replace(/^S\d+/, "")}</strong>
                 <span>{stateLabel}</span>
               </div>

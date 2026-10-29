@@ -1,24 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { FREE_LLM_PRESET } from "@media-track/workflow";
 
 vi.mock("./demo-mode", () => ({ isDemoMode: vi.fn(() => false) }));
-vi.mock("./deployment-update-server", () => ({ loadDeploymentUpdateState: vi.fn(async () => null) }));
+vi.mock("./update-view-server", () => ({ loadUpdateView: vi.fn(async () => ({ available: null, current: { label: "v2026.09.28", tag: "v2026.09.28" } })) }));
 vi.mock("./workflow-runtime", () => ({
   getAccountScopedSettings: vi.fn(() => ({ getSetting: async () => null })),
   getCurrentAccountId: vi.fn(async () => "acct_default"),
   getLlmConfig: vi.fn(async () => ({ baseURL: "https://llm.example", modelId: "m" })),
+  resolveAgentModelConfig: vi.fn(async () => ({
+    baseURL: "https://llm.example",
+    modelId: "m",
+    source: "db",
+  })),
   getWorkflowRepository: vi.fn(),
   isMultiUserEnabled: vi.fn(() => false),
+  resolveIsDesktop: vi.fn(() => false),
   PANSOU_BASE_URL_SETTING_KEY: "pansou_base_url",
   PANSOU_HEALTH_SETTING_KEY: "pansou_last_probe",
   UNAUTHENTICATED_ACCOUNT_ID: "acct_unauthenticated",
 }));
 
 import { isDemoMode } from "./demo-mode";
-import { loadDeploymentUpdateState } from "./deployment-update-server";
+import { loadUpdateView } from "./update-view-server";
 import {
   dismissSettingsAttentionItem,
   loadSettingsAttentionSummary,
   markSettingsAttentionSeen,
+  resolveCurrentIsOwner,
 } from "./settings-attention-server";
 import {
   getAccountScopedSettings,
@@ -26,14 +34,15 @@ import {
   getLlmConfig,
   getWorkflowRepository,
   isMultiUserEnabled,
+  resolveAgentModelConfig,
+  resolveIsDesktop,
 } from "./workflow-runtime";
 
-const UPDATE_BEHIND = {
-  kind: "container" as const,
-  behind: true,
-  currentShort: "1111111",
-  latestShort: "2222222",
+const VIEW_UPDATE = {
+  available: { tag: "v2026.10.02", commit: "2".repeat(40), date: "2026-10-02", notes: [] },
+  current: { label: "v2026.09.28", tag: "v2026.09.28" },
 };
+const VIEW_LATEST = { available: null, current: { label: "v2026.09.28", tag: "v2026.09.28" } };
 
 type Drive = { id: string; provider: string; label: string | null; status: "active" | "frozen" };
 
@@ -68,7 +77,15 @@ beforeEach(() => {
     baseURL: "https://llm.example",
     modelId: "m",
   });
-  (loadDeploymentUpdateState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+  // 生效配置与 DB 配置保持一致的自定义形态（已配置）；免费预设回落用例在
+  // 各测试里单独 override。
+  (resolveAgentModelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+    baseURL: "https://llm.example",
+    modelId: "m",
+    source: "db",
+  });
+  (loadUpdateView as ReturnType<typeof vi.fn>).mockResolvedValue(VIEW_LATEST);
+  (resolveIsDesktop as ReturnType<typeof vi.fn>).mockReturnValue(false);
   (isMultiUserEnabled as ReturnType<typeof vi.fn>).mockReturnValue(false);
   // clearAllMocks 会连声明处的实现一起清掉,这里补回默认值:没配自建搜索源。
   (getAccountScopedSettings as ReturnType<typeof vi.fn>).mockReturnValue({
@@ -81,7 +98,7 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
     const { repository, accountSettings } = makeRepository([
       { id: "cs1", provider: "quark", label: null, status: "frozen" },
     ]);
-    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const summary = await loadSettingsAttentionSummary({});
     expect(summary.items.map((i) => i.id)).toEqual(["frozen:cs1"]);
     expect(summary.count).toBe(1);
     const raw = accountSettings.get("acct_defaultattention_state_since");
@@ -100,17 +117,17 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
     accountSettings.set("acct_defaultattention_state_since", JSON.stringify({ "frozen:cs1": T_OLD }));
     accountSettings.set("acct_defaultattention_seen_at", T_MID);
 
-    const cleared = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const cleared = await loadSettingsAttentionSummary({});
     expect(cleared.count).toBe(0); // badge cleared…
     expect(cleared.severity).toBeNull();
     expect(cleared.items).toHaveLength(1); // …but inbox still lists it
 
     // Drive recovers → state ends (entry dropped on read)…
     drives[0]!.status = "active";
-    await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    await loadSettingsAttentionSummary({});
     // …then freezes AGAIN → fresh state_since > seen_at → badge returns.
     drives[0]!.status = "frozen";
-    const refrozen = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const refrozen = await loadSettingsAttentionSummary({});
     expect(refrozen.count).toBe(1);
     expect(refrozen.severity).toBe("blocker");
   });
@@ -124,35 +141,33 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
       JSON.stringify({ "frozen:cs1": T_MID }),
     );
 
-    const dismissed = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const dismissed = await loadSettingsAttentionSummary({});
     expect(dismissed.items).toEqual([]);
     expect(dismissed.count).toBe(0);
 
     // Re-freeze AFTER the dismissal → new occurrence → dismissal no longer applies.
     drives[0]!.status = "active";
-    await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    await loadSettingsAttentionSummary({});
     drives[0]!.status = "frozen";
-    const refrozen = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const refrozen = await loadSettingsAttentionSummary({});
     expect(refrozen.items.map((i) => i.id)).toEqual(["frozen:cs1"]);
     expect(refrozen.count).toBe(1);
   });
 
   it("update item is owner-only in multi-user, implicit owner in single-user", async () => {
-    (loadDeploymentUpdateState as ReturnType<typeof vi.fn>).mockResolvedValue(UPDATE_BEHIND);
+    (loadUpdateView as ReturnType<typeof vi.fn>).mockResolvedValue(VIEW_UPDATE);
 
-    const single = await loadSettingsAttentionSummary({
-      ...{ origin: "https://o.example" },
-    });
+    const single = await loadSettingsAttentionSummary({});
     expect(single.items.some((i) => i.kind === "update_available")).toBe(true);
 
     (isMultiUserEnabled as ReturnType<typeof vi.fn>).mockReturnValue(true);
     (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_bob");
     makeRepository([], { acct_bob: { isOwner: false } });
-    const member = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const member = await loadSettingsAttentionSummary({});
     expect(member.items.some((i) => i.kind === "update_available")).toBe(false);
 
     makeRepository([], { acct_bob: { isOwner: true } });
-    const owner = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const owner = await loadSettingsAttentionSummary({});
     expect(owner.items.some((i) => i.kind === "update_available")).toBe(true);
   });
 
@@ -180,25 +195,35 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
     });
   });
 
-  it("non-owners never trigger the update probe (badge polls every 8s; the probe can block 5s cold)", async () => {
-    (loadDeploymentUpdateState as ReturnType<typeof vi.fn>).mockResolvedValue(UPDATE_BEHIND);
+  it("non-owners never trigger the update view (badge polls every 8s; loadUpdateView can hit the updater)", async () => {
+    (loadUpdateView as ReturnType<typeof vi.fn>).mockResolvedValue(VIEW_UPDATE);
     (isMultiUserEnabled as ReturnType<typeof vi.fn>).mockReturnValue(true);
     (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_bob");
 
     makeRepository([], { acct_bob: { isOwner: false } });
-    await loadSettingsAttentionSummary({ origin: "https://o.example" });
-    expect(loadDeploymentUpdateState).not.toHaveBeenCalled();
+    await loadSettingsAttentionSummary({});
+    expect(loadUpdateView).not.toHaveBeenCalled();
 
-    // 站主仍照常探测。
+    // 站主仍照常读取发布视图。
     makeRepository([], { acct_bob: { isOwner: true } });
-    await loadSettingsAttentionSummary({ origin: "https://o.example" });
-    expect(loadDeploymentUpdateState).toHaveBeenCalled();
+    await loadSettingsAttentionSummary({});
+    expect(loadUpdateView).toHaveBeenCalledWith({ updaterStatus: false });
+  });
+
+  it("still offers the update badge on desktop when a newer release exists (links to the update tab)", async () => {
+    (loadUpdateView as ReturnType<typeof vi.fn>).mockResolvedValue(VIEW_UPDATE);
+    (resolveIsDesktop as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    makeRepository([]);
+    const summary = await loadSettingsAttentionSummary({});
+    expect(loadUpdateView).toHaveBeenCalledWith({ updaterStatus: false });
+    const item = summary.items.find((i) => i.kind === "update_available");
+    expect(item?.href).toContain("tab=update");
   });
 
   it("never writes attention state for the unauthenticated sentinel", async () => {
     (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");
     const { repository } = makeRepository([]);
-    await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    await loadSettingsAttentionSummary({});
     expect(repository.setAccountSetting).not.toHaveBeenCalled();
   });
 
@@ -234,7 +259,7 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     makeRepository([]);
 
-    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const summary = await loadSettingsAttentionSummary({});
 
     expect(summary.items.map((i) => i.kind)).toContain("search_source_unreachable");
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -250,7 +275,7 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
       getSetting: async (key: string) => settings.get(key) ?? null,
     });
     makeRepository([]);
-    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const summary = await loadSettingsAttentionSummary({});
     expect(summary.items.map((i) => i.kind)).not.toContain("search_source_unreachable");
   });
 
@@ -260,16 +285,114 @@ describe("loadSettingsAttentionSummary — per-account state", () => {
       getSetting: async (key: string) => settings.get(key) ?? null,
     });
     makeRepository([]);
-    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const summary = await loadSettingsAttentionSummary({});
     expect(summary.items.map((i) => i.kind)).not.toContain("search_source_unreachable");
   });
 
   it("demo mode returns empty without touching the repository", async () => {
     (isDemoMode as ReturnType<typeof vi.fn>).mockReturnValue(true);
     const { repository } = makeRepository([{ id: "cs1", provider: "quark", label: null, status: "frozen" }]);
-    const summary = await loadSettingsAttentionSummary({ origin: "https://o.example" });
+    const summary = await loadSettingsAttentionSummary({});
     expect(summary).toEqual({ count: 0, severity: null, items: [] });
     expect(repository.listConnectedStorages).not.toHaveBeenCalled();
+  });
+});
+
+describe("missing_llm 判定口径 — 生效配置（resolveAgentModelConfig），非原始 DB 配置", () => {
+  it("零配置出厂态：DB/env 全空回落免费预设，不再报「还没配置 AI 模型」", async () => {
+    makeRepository([]);
+    // 原始 DB 配置就是空的（零配置出厂态）——若判定还看这层，就会误报。
+    (getLlmConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      baseURL: undefined,
+      apiKey: undefined,
+      modelId: undefined,
+    });
+    // 生效配置与获取链路同源：DB+env 全空 → FREE_LLM_PRESET（Kilo 免费池）。
+    (resolveAgentModelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FREE_LLM_PRESET,
+      source: "free-preset",
+    });
+
+    const summary = await loadSettingsAttentionSummary({});
+
+    expect(summary.items.map((i) => i.kind)).not.toContain("missing_llm");
+    expect(summary.count).toBe(0);
+  });
+
+  it("「只剩 API Key 的残留」形态（清空地址保存后）同样回落免费预设，不误报", async () => {
+    makeRepository([]);
+    (getLlmConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      baseURL: undefined,
+      apiKey: "sk-leftover",
+      modelId: undefined,
+    });
+    (resolveAgentModelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...FREE_LLM_PRESET,
+      source: "free-preset",
+    });
+
+    const summary = await loadSettingsAttentionSummary({});
+
+    expect(summary.items.map((i) => i.kind)).not.toContain("missing_llm");
+  });
+
+  it("半截配置（有地址没模型名）真的无法构造模型 → 仍提醒", async () => {
+    makeRepository([]);
+    (getLlmConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      baseURL: "https://llm.example",
+      apiKey: undefined,
+      modelId: undefined,
+    });
+    // 半截配置不回落（用户错误不得静默变成免费池），原样返回缺 modelId。
+    (resolveAgentModelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      baseURL: "https://llm.example",
+      source: "db",
+    });
+
+    const summary = await loadSettingsAttentionSummary({});
+
+    expect(summary.items.map((i) => i.kind)).toContain("missing_llm");
+  });
+
+  // Copilot r2 C：Boolean(baseURL && modelId) 把空白串当 truthy —— baseURL 是
+  // 纯空白 + modelId 有值的形态会被误标 configured、抑制提醒，而获取链路的
+  // llmConfigError 会拒绝这种配置。判定必须与 llmConfigError 同口径。
+  it("空白串 baseURL + 有值 modelId（llmConfigError 拒绝的形态）→ 仍报 missing_llm", async () => {
+    makeRepository([]);
+    (resolveAgentModelConfig as ReturnType<typeof vi.fn>).mockResolvedValue({
+      baseURL: "   ",
+      modelId: "m",
+      source: "db",
+    });
+
+    const summary = await loadSettingsAttentionSummary({});
+
+    expect(summary.items.map((i) => i.kind)).toContain("missing_llm");
+  });
+});
+
+describe("resolveCurrentIsOwner — single-user mode", () => {
+  // 单用户下经隧道来的匿名访客带一个随便什么 mt_session 也能过 proxy(只查有无),
+  // getCurrentAccountId() 会给这样的请求哨兵账号。哨兵绝不能被当成站主。
+  it("is not the owner for the unauthenticated sentinel", async () => {
+    makeRepository([]);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");
+    expect(await resolveCurrentIsOwner()).toBe(false);
+  });
+
+  it("is the owner for acct_default (LAN, or a valid remote session)", async () => {
+    makeRepository([]);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_default");
+    expect(await resolveCurrentIsOwner()).toBe(true);
+  });
+
+  it("gives the sentinel no update item and never reads the update view in the attention summary", async () => {
+    (loadUpdateView as ReturnType<typeof vi.fn>).mockResolvedValue(VIEW_UPDATE);
+    (getCurrentAccountId as ReturnType<typeof vi.fn>).mockResolvedValue("acct_unauthenticated");
+    makeRepository([]);
+    const summary = await loadSettingsAttentionSummary({});
+    expect(loadUpdateView).not.toHaveBeenCalled();
+    expect(summary.items.some((i) => i.kind === "update_available")).toBe(false);
   });
 });
 

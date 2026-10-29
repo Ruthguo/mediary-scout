@@ -1,7 +1,6 @@
 import { driveConnectionBadge } from "../../lib/settings-badge";
 import { maskProviderUid } from "../../lib/mask-provider-uid";
 import { connection } from "next/server";
-import { headers } from "next/headers";
 import { Suspense } from "react";
 import { Bell, Bot, Cable, CalendarClock, Clapperboard, ExternalLink, Gauge, KeyRound, Languages, Radio, ShieldCheck, Subtitles, TriangleAlert, Users } from "lucide-react";
 import { AppSidebar } from "../../components/app-sidebar";
@@ -12,9 +11,11 @@ import { PushNotificationForm } from "../../components/push-notification-form";
 import { PreferredLanguageForm } from "../../components/preferred-language-form";
 import { QualityPreferenceForm } from "../../components/quality-preference-form";
 import { LlmConfigForm } from "../../components/llm-config-form";
+import { RestoreFreeLlmButton } from "../../components/restore-free-llm-button";
 import { TmdbApiKeyForm } from "../../components/tmdb-api-key-form";
 import { AssrtTokenForm } from "../../components/assrt-token-form";
 import { ProwlarrConfigForm } from "../../components/prowlarr-config-form";
+import { HaisouConfigForm } from "../../components/haisou-config-form";
 import { JevPrefilterForm } from "../../components/jev-prefilter-form";
 import { ServiceBlock } from "../../components/service-block";
 import { AgentMemoryNotes, AgentMemoryStats } from "../../components/agent-memory-panel";
@@ -25,7 +26,7 @@ import {
   memoryStatsForUi,
   toMemoryItem,
 } from "../../lib/agent-memory-server";
-import { assrtPills, isEnvBackedValue, jevPills, llmPills, pansouPills, prowlarrPills, tmdbPills } from "../../lib/service-status";
+import { assrtPills, haisouPills, isEnvBackedValue, jevPills, llmPills, pansouPills, prowlarrPills, tmdbPills } from "../../lib/service-status";
 import { PanSouConfigForm } from "../../components/pansou-config-form";
 import { DailySweepForm } from "../../components/daily-sweep-form";
 import { PatrolConcurrencyForm } from "../../components/patrol-concurrency-form";
@@ -38,7 +39,6 @@ import { UpdateSection } from "../../components/settings/update-section";
 import { GitHubNameplate } from "../../components/github-nameplate";
 import { SettingsActionInbox } from "../../components/settings-action-inbox";
 import { loadSettingsAttentionSummary, markSettingsAttentionSeen } from "../../lib/settings-attention-server";
-import { resolveRequestOrigin } from "../../lib/request-origin";
 import {
   getAccountConnectedStorages,
   getAccountScopedSettings,
@@ -64,6 +64,8 @@ import {
   PROWLARR_BASE_URL_SETTING_KEY,
   PROWLARR_API_KEY_SETTING_KEY,
   getProwlarrConfig,
+  HAISOU_API_KEY_SETTING_KEY,
+  getHaisouApiKey,
   resolveAgentModelConfig,
   getJevConfig,
   getJevBaseUrlOverride,
@@ -77,7 +79,15 @@ import {
   resolveGlobalWorkspace,
   resolveIsDesktop,
 } from "../../lib/workflow-runtime";
-import { brandSupportsProwlarr, brandsSupportingProwlarr, getStorageBrand, isRegisteredStorageProvider } from "@media-track/workflow";
+import {
+  brandSupportsProwlarr,
+  brandsSupportingProwlarr,
+  formatDriveSpaceSummary,
+  FREE_LLM_PRESET,
+  getStorageBrand,
+  isFreeLlmPreset,
+  isRegisteredStorageProvider,
+} from "@media-track/workflow";
 import { isDemoMode } from "../../lib/demo-mode";
 
 export default function SettingsPage({
@@ -104,7 +114,7 @@ export default function SettingsPage({
           <div className="settings-card">
             <p>
               🔭 这是只读演示站,不提供网盘连接、登录与任何写入设置。
-              想真正使用(连 夸克/115/光鸭/123/天翼、配 LLM key、自定义画质/通知)请{" "}
+              想真正使用(连 夸克/UC/115/光鸭/123/天翼、配 LLM key、自定义画质/通知)请{" "}
               <a href="https://github.com/fancydirty/mediary-scout" target="_blank" rel="noreferrer">
                 自部署
               </a>
@@ -211,8 +221,7 @@ async function SettingsAttentionSection({
   // Loader resolves account/drives once (including optional ?w deep-link context).
   await connection();
   const { w } = await searchParams;
-  const origin = resolveRequestOrigin(await headers());
-  const summary = await loadSettingsAttentionSummary({ ...(w ? { w } : {}), origin });
+  const summary = await loadSettingsAttentionSummary({ ...(w ? { w } : {}) });
   // AFTER the summary load: anything first sighted during THIS render gets
   // createdAt <= the seen_at written here → never badges the page it was shown on.
   await markSettingsAttentionSeen();
@@ -313,13 +322,20 @@ async function LlmConfigSection() {
   const modelId = (await repository.getSetting(LLM_MODEL_ID_SETTING_KEY)) ?? "";
   const apiKeySet = Boolean((await repository.getSetting(LLM_API_KEY_SETTING_KEY))?.trim());
   // The form shows the DB values; the pill shows what acquisitions will actually use —
-  // the worker's own resolver (DB → AGENT_MODEL_* → XIAOMI_MIMO_*). fromEnv: a
-  // non-blank effective value was filled in by env because its DB field is blank.
+  // the worker's own resolver (DB → AGENT_MODEL_* → XIAOMI_MIMO_* → 出厂免费预设).
   const effectiveLlm = await resolveAgentModelConfig(repository);
+  // 免费档判定用 spec 的 predicate（生效值逐字 == 出厂预设），不只看 source：
+  // 「换回免费模型」把预设写进 DB 后 source 是 "db"，但界面必须回到出厂态
+  // （胶囊「Kilo 免费池」、表单预填、无按钮）——spec e2e 第 2 步就断言这个。
+  const fromFreePreset = isFreeLlmPreset(effectiveLlm);
+  // fromEnv: a non-blank effective value was filled in by env because its DB field is blank.
+  // 免费档不算 env 补的（预设是我们写死的）：isEnvBackedValue 对「DB 空 + 预设生效值」
+  // 会误报 true，以前免费态胶囊错误地叠「来自环境变量」就是这么来的。
   const llmFromEnv =
-    isEnvBackedValue(baseURL, effectiveLlm.baseURL) ||
-    isEnvBackedValue(modelId, effectiveLlm.modelId) ||
-    (!apiKeySet && Boolean(effectiveLlm.apiKey?.trim()));
+    !fromFreePreset &&
+    (isEnvBackedValue(baseURL, effectiveLlm.baseURL) ||
+      isEnvBackedValue(modelId, effectiveLlm.modelId) ||
+      (!apiKeySet && Boolean(effectiveLlm.apiKey?.trim())));
   // Jev lives here, not under 资源提供商: it is not a resource SOURCE, it is a second
   // AI service (with its own key) that assists the main model. One read, one rule:
   // getJevConfig applies DB→env fallback; isJevPrefilterActive is the same go/no-go
@@ -362,15 +378,42 @@ async function LlmConfigSection() {
           baseURL: effectiveLlm.baseURL ?? "",
           modelId: effectiveLlm.modelId ?? "",
           fromEnv: llmFromEnv,
+          fromFreePreset,
         })}
-        summary="任意 OpenAI 兼容服务，必填；Key 只存你本机。"
-        details={
-          <p>
-            自带你自己的 key——它只存在你这台机器的数据库里，作者看不到。未配置时获取会失败；本地模型 Key 可留空。留空 API Key 不会改动已保存的值。
-          </p>
+        summary={
+          fromFreePreset
+            ? "任意 OpenAI 兼容服务；当前用的是内置免费默认值，可直接改成自己的。"
+            : "任意 OpenAI 兼容服务；Key 只存你本机。"
         }
+        details={
+          fromFreePreset ? (
+            <p>
+              当前生效的内置免费默认值来自 Kilo Code 公共免费模型池：无需注册、不用填
+              Key；每小时限 200 次请求，模型为 NVIDIA Nemotron 550B（100 万 token
+              上下文）。该池由第三方提供，可能限速或变动，不保证一直可用。清空地址保存即恢复默认。
+            </p>
+          ) : (
+            <p>
+              自带你自己的 key——它只存在你这台机器的数据库里，作者看不到。未配置时回落内置免费模型；本地模型
+              Key 可留空。留空 API Key 不会改动已保存的值。
+            </p>
+          )
+        }
+        headerAction={fromFreePreset ? undefined : <RestoreFreeLlmButton />}
       >
-        <LlmConfigForm baseURL={baseURL} modelId={modelId} apiKeySet={apiKeySet} />
+        {/* 出厂态表单预填：DB 空时展示预设的真实值（可改）。只在免费档预填 ——
+            env 层在供值时（DB 空、source=env）保持显示 DB 空值，预填会把预设冻进
+            账号行、盖掉 env 层（同下方 Jev override 不预填继承值的理由）。
+            key 绑定服务端初始值：保存/「换回免费模型」后的 router.refresh() 会让
+            useState 的旧值让位给服务端真相 —— 否则点完换回按钮表单还留着旧服务地址，
+            用户再点一次保存就把旧配置悄悄写回去了（走查实证过这个陷阱）。输入过程
+            不会触发（props 只在 action 成功 + refresh 后才变）。 */}
+        <LlmConfigForm
+          key={`${fromFreePreset ? FREE_LLM_PRESET.baseURL : baseURL}|${fromFreePreset ? FREE_LLM_PRESET.modelId : modelId}`}
+          baseURL={fromFreePreset ? FREE_LLM_PRESET.baseURL : baseURL}
+          modelId={fromFreePreset ? FREE_LLM_PRESET.modelId : modelId}
+          apiKeySet={apiKeySet}
+        />
       </ServiceBlock>
       <ServiceBlock
         name="Jev 候选预筛"
@@ -488,6 +531,9 @@ async function ResourceProviderSection() {
   const pansouHealth = (await repository.getSetting(PANSOU_HEALTH_SETTING_KEY)) ?? "";
   const prowlarrBaseURL = (await repository.getSetting(PROWLARR_BASE_URL_SETTING_KEY)) ?? "";
   const prowlarrApiKeySet = Boolean((await repository.getSetting(PROWLARR_API_KEY_SETTING_KEY))?.trim());
+  const haisouApiKeySet = Boolean((await repository.getSetting(HAISOU_API_KEY_SETTING_KEY))?.trim());
+  // The form shows DB state; the pill follows what the worker mounts (DB → env).
+  const haisouFromEnv = !haisouApiKeySet && Boolean((await getHaisouApiKey(repository))?.trim());
   // The form shows the DB values; the pill follows what the worker mounts
   // (getProwlarrConfig: DB → env PROWLARR_BASE_URL / PROWLARR_API_KEY).
   const prowlarr = await getProwlarrConfig(repository);
@@ -555,6 +601,30 @@ async function ResourceProviderSection() {
       >
         <PanSouConfigForm baseURL={pansouBaseURL} />
       </ServiceBlock>
+      <ServiceBlock
+        name="海搜 (haisou)"
+        pills={haisouPills({ apiKeySet: haisouApiKeySet || haisouFromEnv, fromEnv: haisouFromEnv })}
+        summary="补充源：自有索引（夸克 2.48 亿文件，光鸭/天翼也有量）。走站方官方 API，每天前 100 次免费。"
+        details={
+          <>
+            <p>
+              海搜是独立索引的网盘搜索库，和 PanSou 的数据源不重合。这个接入走它挂在 idatariver 上的<b>官方 API</b>（海搜页面底部的「开放接口」就指向那里），不是去爬它的网站——所以只需要一个 API Key，不需要登录账号或粘贴 cookie。
+            </p>
+            <p>
+              <b>每天前 100 次免费</b>，之后阶梯计费（约 $0.0001/次）。按常规用量（每天巡检一两个时间点）够用；如果你把巡检时间点加得很密、或同时追很多部，可能会碰到额度上限。额度用完后这个源会返回「没结果」而不是报错，所以别把它当成 PanSou 的唯一来源。
+            </p>
+            <p>
+              取 Key：{" "}
+              <a href="https://www.idatariver.com/zh-cn/console/apikeys" target="_blank" rel="noopener noreferrer">
+                idatariver 控制台 → API Keys <ExternalLink size={12} style={{ verticalAlign: "-1px" }} />
+              </a>
+              {" "}（注册免费，选中 haisou API 项目即可）
+            </p>
+          </>
+        }
+      >
+        <HaisouConfigForm apiKeySet={haisouApiKeySet} />
+      </ServiceBlock>
       {showProwlarr ? (
         <ServiceBlock
           name="Prowlarr 磁力 / PT"
@@ -608,7 +678,7 @@ async function SubtitleSourceSection() {
         details={
           <>
             <p>
-              外挂中文字幕来源：assrt.net（伪射手）有免费官方 API，agent 获取非国产剧集/电影时会自动搜字幕候选并挑合适的落盘到视频旁。需网盘支持外链离线落盘（115 / 光鸭 / 123 支持，123 会占用该账号的离线下载额度；夸克、天翼没有离线接口，不触发）。免费申请 Token，留空则该功能完全不启用。国产内容原生中文对白，不需要此功能。
+              外挂中文字幕来源：assrt.net（伪射手）有免费官方 API，agent 获取非国产剧集/电影时会自动搜字幕候选并挑合适的落盘到视频旁。需网盘支持外链离线落盘（115 / 光鸭 / 123 支持，123 会占用该账号的离线下载额度；夸克、UC、天翼没有可用的离线接口，不触发）。免费申请 Token，留空则该功能完全不启用。国产内容原生中文对白，不需要此功能。
             </p>
             <p>
               了解 assrt.net{" "}
@@ -638,7 +708,7 @@ function providerLabel(provider: string): string {
 async function Pan115Section() {
   await connection();
   const status = await getPan115ConnectionStatus();
-  const drives = await getAccountConnectedStorages();
+  const drives = await getAccountConnectedStorages({ includeSpace: true });
 
   return (
     <section className="panel" style={{ maxWidth: 720 }}>
@@ -648,7 +718,7 @@ async function Pan115Section() {
             <Cable size={16} aria-hidden style={{ verticalAlign: "-2px", marginRight: 8 }} />
             网盘连接
           </h2>
-          <p className="panel-note">每块盘是独立工作区，左上角可切换；凭证入库后自动用于转存</p>
+          <p className="panel-note">多块网盘统一协作：根据资源画质与剩余空间自动入库，单盘能收齐绝不拆盘</p>
         </div>
         {(() => {
           // #93: derive the header badge from ALL drives — 115-only status made
@@ -676,6 +746,24 @@ async function Pan115Section() {
           {drives.map((drive) => {
             const frozen = drive.status === "frozen";
             const ready = !frozen && drive.provisioned;
+            const spaceSummary = formatDriveSpaceSummary(drive.space);
+            let dotTitle = "目录待建";
+            let dotAriaLabel = "目录待建";
+            if (frozen) {
+              dotTitle = "凭证已失效，重新绑定同一账号即可恢复";
+              dotAriaLabel = "掉线";
+            } else if (ready) {
+              dotTitle = "目录已就绪";
+              dotAriaLabel = "就绪";
+            }
+            let statusMetaNode = <span>就绪</span>;
+            if (frozen) {
+              statusMetaNode = <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>;
+            } else if (!drive.provisioned) {
+              statusMetaNode = <span className="tone-amber-text">目录待建</span>;
+            } else if (drive.connectedAt) {
+              statusMetaNode = <span>{drive.connectedAt.slice(0, 10)} 连接</span>;
+            }
             return (
               <div key={drive.id} className={`drive-card${frozen ? " is-frozen" : ""}`}>
                 <div className="drive-card-head">
@@ -691,23 +779,19 @@ async function Pan115Section() {
                   <span
                     className={`drive-dot ${ready ? "green" : "amber"}`}
                     role="img"
-                    title={frozen ? "凭证已失效，重新绑定同一账号即可恢复" : ready ? "目录已就绪" : "目录待建"}
-                    aria-label={frozen ? "掉线" : ready ? "就绪" : "目录待建"}
+                    title={dotTitle}
+                    aria-label={dotAriaLabel}
                   />
                 </div>
                 <div className="drive-card-uid" title={drive.providerUid}>
                   {maskProviderUid(drive.providerUid)}
                 </div>
                 <div className="drive-card-meta">
-                  {frozen ? (
-                    <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>
-                  ) : !drive.provisioned ? (
-                    <span className="tone-amber-text">目录待建</span>
-                  ) : drive.connectedAt ? (
-                    <span>{drive.connectedAt.slice(0, 10)} 连接</span>
-                  ) : (
-                    <span>就绪</span>
-                  )}
+                  {statusMetaNode}
+                  <span> · </span>
+                  <span className={spaceSummary.overQuota ? "tone-amber-text" : undefined}>
+                    {spaceSummary.badgeText}
+                  </span>
                 </div>
                 <div className="drive-card-actions">
                   <TestConnectionButton storageId={drive.id} />
@@ -722,7 +806,7 @@ async function Pan115Section() {
       <p className="panel-note drive-add-heading">
         {drives.length > 0 ? "添加网盘 · 选择品牌开始连接" : "添加你的第一块网盘"}
         {drives.length > 0 ? (
-          <span className="drive-add-hint">不同账号即新增一块独立工作区；绑已连的同一账号会自动刷新登录</span>
+          <span className="drive-add-hint">不同账号即新增一块可用网盘；绑已连的同一账号会自动刷新登录</span>
         ) : null}
       </p>
       <AddDriveBrandTabs defaultBrand={drives.length > 0 ? null : "pan115"} />

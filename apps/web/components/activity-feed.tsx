@@ -117,7 +117,10 @@ export function ActivityFeed({ storageId }: { storageId?: string | undefined }) 
 export function BookActivityRow({ book }: { book: ActivityBookItem }) {
   return (
     <div className="act-row act-row-active">
-      {book.coverUrl ? <img className="act-poster" src={book.coverUrl} alt="" /> : <span className="act-poster act-poster-fallback tone-info">书</span>}
+      {book.coverUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img className="act-poster" src={book.coverUrl} alt="" />
+      ) : <span className="act-poster act-poster-fallback tone-info">书</span>}
       <div className="act-row-body">
         <div className="act-row-head"><strong>{book.title}</strong><span className="act-sub">{book.authors}</span></div>
         <div className="act-bar"><div className="act-bar-fill" style={{ width: "55%" }} /></div>
@@ -270,7 +273,10 @@ export function CompletedRow({ item }: { item: ActivityCompletedItem }) {
   const failed = item.status === "failed";
   return (
     <div className="act-row act-row-done">
-      {item.imageUrl ? <img className="act-poster" src={item.imageUrl} alt="" /> : poster(item.posterPath, item.title, ok ? "success" : "warn")}
+      {item.imageUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img className="act-poster" src={item.imageUrl} alt="" />
+      ) : poster(item.posterPath, item.title, ok ? "success" : "warn")}
       <div className="act-row-body act-row-inline">
         <strong>{item.title}</strong>
         {item.seasonLabel ? <span className="act-sub">{item.seasonLabel}</span> : null}

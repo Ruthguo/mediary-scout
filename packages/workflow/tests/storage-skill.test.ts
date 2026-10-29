@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getStorageSkill, readSkillSection } from "../src/index.js";
+import { buildMultiDriveAllocationBlock, getStorageSkill, readSkillSection } from "../src/index.js";
 
 describe("brand-aware storage skill", () => {
   it("getStorageSkill('quark') teaches 转存分享, 无磁力, and fail-loud codes", () => {
@@ -8,6 +8,24 @@ describe("brand-aware storage skill", () => {
     expect(quark).toMatch(/无磁力|NO magnet|没有.*磁力/i);
     expect(quark).toContain("41006"); // 分享不存在 fail-loud code
     expect(quark).toContain("夸克");
+  });
+
+  it("getStorageSkill('uc') does NOT throw and teaches UC's own fail-loud codes + dead-link norm", () => {
+    // A missing arm here THROWS at runtime: the agent prompt tells it to
+    // readSkill("dead-links-black-box") on its first transfer failure, so a UC
+    // drive would crash mid-run instead of degrading.
+    const uc = getStorageSkill("uc");
+    expect(uc).toContain("UC网盘");
+    expect(uc).toContain("转存分享");
+    expect(uc).toMatch(/无磁力|NO magnet/i);
+    // UC's OWN live-verified codes, not 夸克's 41006.
+    expect(uc).toContain("41011"); // 分享地址已失效
+    expect(uc).toContain("41012"); // 好友已取消了分享
+    expect(uc).toContain("41027"); // 分享不存在
+    expect(uc).toContain("UC_NO_MAGNET");
+    // The 54%-dead reality must be stated, or the agent reads it as "no resources".
+    expect(uc).toMatch(/死链|dead/i);
+    expect(uc).not.toContain("QUARK_NO_MAGNET");
   });
 
   it("getStorageSkill('pan115') keeps the 115 transfer model (秒传/magnet)", () => {
@@ -128,5 +146,47 @@ describe("brand-aware storage skill", () => {
     expect(readSkillSection("protocol", "quark")).toContain("Evidence");
     expect(readSkillSection("dedup", "quark")).toContain("larger");
     expect(readSkillSection("nope", "quark")).toContain("Unknown skill section");
+  });
+
+  it("buildMultiDriveAllocationBlock and readSkillSection inject multi-drive rules when >1 drive is present (C6)", () => {
+    const drives = [
+      {
+        storageId: "cs_115",
+        provider: "pan115",
+        label: "115 网盘",
+        space: { totalBytes: 40 * 1024 ** 4, usedBytes: 19 * 1024 ** 4 },
+      },
+      {
+        storageId: "cs_quark",
+        provider: "quark",
+        label: "夸克网盘",
+        space: { totalBytes: 10 * 1024 ** 3, usedBytes: 1378 * 1024 ** 3 },
+      },
+      {
+        storageId: "cs_123",
+        provider: "pan123",
+        label: "123网盘",
+        space: { totalBytes: 20 * 1024 ** 4, usedBytes: 2 * 1024 ** 4 },
+      },
+    ];
+    const block = buildMultiDriveAllocationBlock(drives, "cs_115");
+    expect(block).toContain("## 你手上有这几块盘");
+    expect(block).toContain("115 网盘 [storageId=cs_115, provider=pan115] — 剩余 21.00 TB");
+    expect(block).toContain("【本剧历史在追主盘】");
+    expect(block).toContain("夸克网盘 [storageId=cs_quark, provider=quark] — 已超配额 1.34 TB");
+    expect(block).toContain("禁止写入");
+    expect(block).toContain("默认一块盘收齐");
+    expect(block).toContain("拆完能拿到的总集数 > 单盘能拿到的集数");
+    expect(block).toContain("严禁为了「均衡剩余空间」而拆盘");
+    expect(block).toContain("同一集绝不在两块盘各存一份");
+
+    const protocolWithMulti = readSkillSection("protocol", "pan115", drives, "cs_115");
+    expect(protocolWithMulti).toContain("## 你手上有这几块盘");
+    expect(protocolWithMulti).toContain("Evidence → Facts → Decision");
+
+    const deadLinksWithMulti = readSkillSection("dead-links-black-box", "pan115", drives, "cs_115");
+    expect(deadLinksWithMulti).toContain("## 你手上有这几块盘");
+    expect(deadLinksWithMulti).toContain("41006"); // quark manual included
+    expect(deadLinksWithMulti).toContain("PAN123_OFFLINE_FAILED"); // 123 manual included
   });
 });

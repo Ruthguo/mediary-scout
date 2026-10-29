@@ -220,6 +220,7 @@ describe("Movie system prompt carries movie-specific invariants", () => {
     [/LAST (action|step)|never mark before|in place|only after/i, "mark is the LAST step, only after the film is in place"],
     [/flattenMovie/, "flattenMovie is the movie extraction"],
     [/transferUntilLanded/, "transferUntilLanded for ranked shares / dead links"],
+    [/redundant.*(quality|resolution|version|copies).*deleteFiles|multiple (quality\/resolution|versions).*keep ONLY/i, "dedup multi-version movie share folders to single copy matching quality preference"],
   ])("mentions %s (%s)", (re) => {
     expect(prompt).toMatch(re);
   });
@@ -229,6 +230,16 @@ describe("Movie system prompt carries movie-specific invariants", () => {
     // TV loop made the agent plan discardStaging() for a film (interrogation caught it).
     expect(prompt).not.toMatch(/discardStaging/);
     expect(prompt).not.toMatch(/moveToSeason/);
+  });
+
+  it("offers alternate-title research only when web access is configured", () => {
+    expect(prompt).not.toMatch(/ALTERNATE TITLES/);
+    const withResearch = buildMovieSystemPrompt({ titleResearch: { web: {} } });
+    expect(withResearch).toMatch(/ALTERNATE TITLES/);
+    expect(withResearch).toMatch(/researchTitle/);
+    expect(withResearch).toMatch(/reference only/i);
+    // A film has no seasons, so the fan-season block must not leak into it.
+    expect(withResearch).not.toMatch(/OFFICIALLY-UNSEGMENTED/);
   });
 });
 

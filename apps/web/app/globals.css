@@ -406,6 +406,42 @@ p {
   width: 320px;
 }
 
+/* 媒体库标题行的盘内快速查找框（.search-box 小变体，LibraryQuickFind）。 */
+.search-box-compact {
+  width: 230px;
+  height: 36px;
+  padding: 0 12px;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.search-box-compact input {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+}
+
+/* 清空按钮仅 query 非空时渲染。 */
+.search-box-compact-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px;
+  /* 命中区不小于 WCAG 2.5.8 的 24×24 触摸最小尺寸（图标仍 14px）。 */
+  min-width: 24px;
+  min-height: 24px;
+  flex-shrink: 0;
+  font-family: inherit;
+}
+
+.search-box-compact-clear:hover {
+  color: var(--text);
+}
+
 .search-box input::placeholder {
   color: var(--text-muted);
 }
@@ -1498,6 +1534,19 @@ p {
 
   .search-box input,
   .search-box-large input {
+    width: 100%;
+  }
+
+  /* 媒体库查找框换行到标题行下方（860px 断点惯例）。 */
+  .library-find-heading {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .search-box-compact {
+    /* 上方 .search-box 的 flex:1 把 flex-basis 压成 0%，会吃掉这里的 width:100%，
+       查找框挤在标题行右侧缩成小条不换行——flex:none 让 width 生效、换到标题下方。 */
+    flex: none;
     width: 100%;
   }
 
@@ -3909,9 +3958,6 @@ select.setting-control {
   padding: 8px 12px;
   font-size: 12px;
 }
-.attention-item-prompt {
-  margin-top: 8px;
-}
 .attention-item-dismiss {
   flex: 0 0 auto;
   border: none;
@@ -3950,81 +3996,6 @@ select.setting-control {
   color: #06210f;
 }
 
-/* ---------- deployment update hint (self-host compose, Settings top) ---------- */
-.update-card {
-  max-width: 720px;
-  margin-bottom: 24px;
-  background: rgba(30, 215, 96, 0.08);
-  border: 1px solid rgba(30, 215, 96, 0.25);
-  border-radius: var(--radius-card);
-  padding: 16px;
-}
-.update-card-heading {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--accent);
-  margin-bottom: 8px;
-}
-.update-card p {
-  color: var(--text-soft);
-}
-.update-card code {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 4px;
-  padding: 1px 5px;
-}
-.update-card-actions {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
-.update-card .ghost-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.update-link {
-  text-decoration: none;
-}
-.update-copy-textarea {
-  width: 100%;
-  margin-top: 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.25);
-  color: var(--text-soft);
-  padding: 10px;
-  font: inherit;
-  resize: vertical;
-}
-.update-copy-block {
-  min-width: 180px;
-}
-.update-prompt-details {
-  margin-top: 10px;
-  font-size: 12px;
-}
-.update-prompt-details summary {
-  color: var(--text-muted);
-  cursor: pointer;
-  list-style: none;
-}
-.update-prompt-details summary::-webkit-details-marker {
-  display: none;
-}
-.update-prompt-details pre {
-  white-space: pre-wrap;
-  color: var(--text-soft);
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  padding: 10px;
-  max-width: 520px;
-}
 
 /* ---------- GitHub nameplate (Settings page bottom — quiet 暗记 + CTA) ---------- */
 .github-nameplate {
@@ -4181,6 +4152,18 @@ select.setting-control {
 .update-kind { position: absolute; left: 0; top: 2px; font-size: 10.5px; font-weight: 600; color: var(--text-faint); }
 .update-kind.is-add { color: var(--accent); }
 .update-kind.is-fix { color: var(--info); }
+.update-status-side { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.update-progress { margin-top: 12px; }
+.update-bar { height: 4px; border-radius: 2px; background: var(--bg-card); margin-top: 8px; overflow: hidden; }
+.update-bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.4s var(--ease-out, ease-out); }
+.update-now { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.update-cmd { margin: 8px 0 0; padding: 10px 12px; border-radius: var(--radius-card); background: var(--bg-raised); font-size: 12.5px; overflow-x: auto; }
+.update-warn { margin: 10px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--warning); }
+.update-failure summary { cursor: pointer; font-size: 12.5px; color: var(--text-muted); }
+.update-migrate .ghost-button { margin-top: 8px; }
+.update-auto-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.update-auto-row .service-toggle { font-size: 13.5px; color: var(--text); }
+.update-auto-row .setting-control { width: auto; }
 
 /* 搜索页空态「近期热门」发现区(#95)。Tab 药丸复用 .filter-pill。 */
 .trending {
@@ -4476,6 +4459,9 @@ select.setting-control {
 .drive-card-actions .secondary-button {
   font-size: 12px;
   padding: 3px 10px;
+  /* A long 测试连接 result sits beside the button: let the message wrap, never the label. */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .drive-add-heading {
@@ -4572,6 +4558,40 @@ select.setting-control {
   font-size: 13.5px;
   font-weight: 600;
   color: var(--text);
+}
+/* 头部行尾的操作位（ServiceBlock 的 headerAction）：flex 行里推到最右；行太窄被
+ * wrap 到第二行时仍贴右，与胶囊同享行的 gap。 */
+.service-block-head-action {
+  margin-left: auto;
+}
+/* 「换回免费模型」（ServiceBlock.headerAction）：主模型块标题行尾的描边小按钮，
+ * mockup 定稿样式（描边胶囊、透明底、软色文字）。次级动作，不与保存按钮争视觉
+ * 权重；hover 才点亮描边提示可点。 */
+.restore-free-llm-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  font-size: 11.5px;
+  line-height: 1.4;
+  background: transparent;
+  color: var(--text-soft);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.restore-free-llm-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.restore-free-llm-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.restore-free-llm-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 /* inline-block, not inline-flex: text-overflow needs a block container, and a
  * user-typed model id (「已配置 · accounts/fireworks/models/…」) must ellipsize

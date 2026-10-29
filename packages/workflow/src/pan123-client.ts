@@ -9,7 +9,7 @@
  * crc32-based signPath signature (the {k,v} pair is injected into the query) plus
  * a fixed header set. There is NO token-refresh endpoint on the web face (all
  * refresh_token flows live on open-api.123pan.com, unrelated to 转存), so a dead
- * token cannot self-heal here: `code===401` throws Pan123AuthError and the upstream
+ * token cannot self-heal here: code 401 / 20101 (see PAN123_AUTH_CODES) throws Pan123AuthError and the upstream
  * registry freezes the connection for the user to re-scan. (This is why there is no
  * onCredentialRefresh / login_another / retry logic — nothing to refresh with.)
  *
@@ -19,6 +19,8 @@
  * nothing. The fix: stringify these id fields BEFORE JSON.parse. `parsePan123Json`
  * is the SINGLE json-parse entry point — no response is ever handed to raw JSON.parse.
  */
+
+import { parseFiniteMetric } from "./domain.js";
 
 const API_BASE = "https://yun.123pan.com/b/api";
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -131,6 +133,12 @@ export class Pan123AuthError extends Error {
   }
 }
 
+/** Envelope codes that mean "this token is no longer logged in". 401 = token invalid /
+ *  expired. 20101 = 未登录: seen in production (2026-09-30) on a 90-day token still inside
+ *  its lifetime, i.e. the session was kicked off (the 123 App's device list, or another
+ *  login pushing it out). Both need a re-scan, so both freeze the drive. */
+const PAN123_AUTH_CODES = new Set([401, 20101]);
+
 export function isPan123AuthError(error: unknown): error is Pan123AuthError {
   return error instanceof Pan123AuthError;
 }
@@ -181,7 +189,7 @@ export class Pan123Client {
   // ── 传输(signPath 签名 + envelope 判定) ──────────────────────────────────
 
   /** 组装签名请求 + envelope 判定。返回响应顶层对象(含 code/data)。
-   *  code===0 成功;code===401 → Pan123AuthError(死 token,不重试/不刷新);其它非 0 → 普通 Error。 */
+   *  code===0 成功;code 401/20101 → Pan123AuthError(死 token,不重试/不刷新);其它非 0 → 普通 Error。 */
   private async signed(
     path: string,
     init: {
@@ -257,7 +265,7 @@ export class Pan123Client {
       throw new Error(`PAN123_HTTP_FAILED: status=${res.status} missing code`);
     }
     const code = numOf(data["code"]);
-    if (code === 401) {
+    if (PAN123_AUTH_CODES.has(code)) {
       throw new Pan123AuthError(`PAN123_AUTH_FAILED: ${strOf(data["message"])}`);
     }
     if (code !== 0) {
@@ -636,6 +644,19 @@ export class Pan123Client {
       method: "POST",
       body: { task_ids: ids },
     });
+  }
+
+  /** Query total and used storage capacity (`GET /b/api/user/info`). */
+  async getSpace(): Promise<{ totalBytes: number; usedBytes: number } | null> {
+    const resp = await this.signed("/user/info", { method: "GET" });
+    const rawData = resp["data"];
+    const data = typeof rawData === "object" && rawData !== null ? (rawData as Record<string, unknown>) : {};
+    const totalBytes = parseFiniteMetric(data["SpacePermanent"]);
+    const usedBytes = parseFiniteMetric(data["SpaceUsed"]);
+    if (!Number.isFinite(totalBytes) || !Number.isFinite(usedBytes) || totalBytes <= 0) {
+      return null;
+    }
+    return { totalBytes, usedBytes };
   }
 }
 

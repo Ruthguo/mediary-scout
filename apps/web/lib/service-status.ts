@@ -31,9 +31,15 @@ export function isEnvBackedValue(dbValue: string | null | undefined, effectiveVa
 const ENV_SOURCE_PILL: ServicePill = { label: "来自环境变量", tone: "neutral" };
 
 /** 主模型：baseURL / modelId 是 resolveAgentModelConfig 的生效值（DB → AGENT_MODEL_* →
- *  XIAOMI_MIMO_*）；fromEnv = 其中非空的一项是 env 补的（DB 那格留空）。
- *  Key 不参与判定 —— 本地模型 Key 可留空（与面板导语一致）。 */
-export function llmPills(input: { baseURL: string; modelId: string; fromEnv: boolean }): ServicePill[] {
+ *  XIAOMI_MIMO_* → 出厂免费预设）；fromEnv = 其中非空的一项是 env 补的（DB 那格留空）。
+ *  Key 不参与判定 —— 本地模型 Key 可留空（与面板导语一致）。
+ *  fromFreePreset = 调用方用 isFreeLlmPreset(effectiveLlm) 按生效 baseURL/modelId
+ *  逐字比较算好传入（不等于 source === "free-preset"：「换回免费模型」按钮写库后
+ *  source 是 db，但值仍逐字等于预设，同样算免费档）：DB 和 env 都空、吃到出厂免费预设时，
+ *  只报一颗「Kilo 免费池」—— 预设的 baseURL/modelId 是我们写死的，展示出来只是噪音；
+ *  也无意叠「来自环境变量」（预设不是 env 补的）。 */
+export function llmPills(input: { baseURL: string; modelId: string; fromEnv: boolean; fromFreePreset?: boolean }): ServicePill[] {
+  if (input.fromFreePreset) return [{ label: "Kilo 免费池", tone: "on" }];
   const hasUrl = nonBlank(input.baseURL);
   const hasModel = nonBlank(input.modelId);
   const source = input.fromEnv ? [ENV_SOURCE_PILL] : [];
@@ -126,6 +132,17 @@ export function prowlarrPills(input: { baseURL: string; apiKeySet: boolean; from
         : { label: "未接入", tone: "off" };
   const source = input.fromEnv && (hasUrl || input.apiKeySet) ? [ENV_SOURCE_PILL] : [];
   return [first, ...source, { label: "仅磁力盘", tone: "neutral" }];
+}
+
+/** 海搜：apikeySet 是 getHaisouApiKey 的生效值（DB → env HAISOU_API_KEY），
+ *  fromEnv = 空的那项由 env 补上。「每天 100 次免费」写进胶囊，因为它是这个源
+ *  最重要的使用约束 —— 额度用完会静默变成「没结果」。 */
+export function haisouPills(input: { apiKeySet: boolean; fromEnv: boolean }): ServicePill[] {
+  const first: ServicePill = input.apiKeySet
+    ? { label: "已接入", tone: "on" }
+    : { label: "未配置", tone: "off" };
+  const source = input.fromEnv && input.apiKeySet ? [ENV_SOURCE_PILL] : [];
+  return [first, ...source, { label: "每日 100 次免费", tone: "neutral" }];
 }
 
 /** assrt：只有 DB 一层（getAssrtToken 不读 env），DB 里有没有 token 就是生效值。 */

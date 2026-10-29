@@ -3,7 +3,7 @@ import { AgentContentFilterError } from "../agent-error.js";
 import { generateText, stepCountIs, type LanguageModel, type ToolSet } from "ai";
 import { z } from "zod";
 import type { SearchHistoryEntry, TaskSandbox } from "./sandbox.js";
-import { readSkillSection, SKILL_SECTION_NAMES } from "./skill.js";
+import { readSkillSection, SKILL_SECTION_NAMES, type PromptDriveSummary } from "./skill.js";
 import {
   DEFAULT_MAX_STEPS,
   buildRepetitionStop,
@@ -14,6 +14,7 @@ import {
 } from "./agent-loop-guards.js";
 import { interpretTool, type AgentToolEvent } from "./activity.js";
 import { LINK_HISTORY_PROMPT } from "./link-history.js";
+import { createTitleResearchTools, type TitleResearchConfig } from "./title-research.js";
 
 /**
  * Phase 3 — the agent loop harness. The strong agent drives its own
@@ -124,13 +125,23 @@ export function buildSandboxToolSet(
     onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
     /** The run's drive brand — selects the brand-specific dead-links section. */
     storageProvider?: string;
+    /** Ordered active drives when running in unified multi-drive mode. */
+    drives?: readonly PromptDriveSummary[];
+    /** Primary storageId (e.g. an ongoing show's home drive). */
+    primaryStorageId?: string | null;
     /** Leftover staging: no search, no transfer, no subtitle landing.
      *  renameSubtitle stays: a leftover .ass/.srt may not match its video. */
     stagingRecovery?: boolean;
+    /** Web-reference tools (alternate titles + fan-season ↔ TMDB episode mapping).
+     *  Absent = no web access. Never registered on a recovery run. */
+    titleResearch?: TitleResearchConfig;
   } = {},
 ): ToolSet {
   const recover = options.stagingRecovery === true;
   const tools: Record<string, unknown> = {
+    // Web reference only: both tools return untrusted evidence, never a
+    // transferable candidate, and never touch storage.
+    ...(!recover && options.titleResearch ? createTitleResearchTools(options.titleResearch) : {}),
     readSkill: {
       description:
         // Section list derived from SKILL_SECTION_NAMES — the single source of
@@ -138,14 +149,22 @@ export function buildSandboxToolSet(
         `Read a section of your domain skill manual ON DEMAND — the hard-won playbook for HOW to act. Sections: ${SKILL_SECTION_NAMES.join(", ")}. Read your sections before you act, and re-read the relevant one the moment its situation arises. Acting from memory instead of the skill is how the old agent hammered the drive and corrupted libraries.`,
       inputSchema: z.object({ section: z.string() }),
       execute: (args: { section: string }) =>
-        Promise.resolve({ section: args.section, body: readSkillSection(args.section, options.storageProvider) }),
+        Promise.resolve({
+          section: args.section,
+          body: readSkillSection(
+            args.section,
+            options.storageProvider,
+            options.drives,
+            options.primaryStorageId,
+          ),
+        }),
     },
     ...(recover
       ? {}
       : {
     viewResourceSnapshot: {
       description:
-        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you. Returns 120 candidates per page (id + title, and · 发布 YYYY-MM-DD when known), with title matches first; pass the displayed next offset to see more. Use this FIRST. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient. " +
+        "View the system's pre-warmed raw snapshot (活期文档). Read-only, free, repeatable — does NOT consume search budget. The system already searched the raw keyword (bare title) for you. Returns paged candidates (id + title, and · 发布 YYYY-MM-DD when known), with title matches first and space reserved per drive on the first page; pass the displayed next offset to see more. Use this FIRST. Do NOT use searchResources to re-search the raw keyword — searchResources is ONLY for 繁体/英文 upgrades when the raw snapshot is insufficient. " +
         LINK_HISTORY_PROMPT,
       inputSchema: z.object({ offset: z.number().int().nonnegative().optional() }),
       execute: (args: { offset?: number }) => Promise.resolve(sandbox.viewResourceSnapshot(args)),
@@ -174,9 +193,13 @@ export function buildSandboxToolSet(
       : {
     transferCandidate: {
       description:
-        "Transfer ONE snapshot-bound candidate into staging, then read back the TRUE materialized files. The candidate must come from a snapshot you searched this task. Refused once coverage is already met.",
-      inputSchema: z.object({ snapshotId: z.string(), candidateId: z.string() }),
-      execute: (args: { snapshotId: string; candidateId: string }) =>
+        "Transfer ONE snapshot-bound candidate into staging, then read back the TRUE materialized files. The candidate must come from a snapshot you searched this task. Optional `storageId` selects a specific connected drive when you have multiple drives of the same brand or want a specific magnet-capable drive; omitted = auto-route to the highest-priority compatible drive with enough free space. Refused once coverage is already met.",
+      inputSchema: z.object({
+        snapshotId: z.string(),
+        candidateId: z.string(),
+        storageId: z.string().optional(),
+      }),
+      execute: (args: { snapshotId: string; candidateId: string; storageId?: string }) =>
         asEvidence(() => sandbox.transferCandidate(args)),
     },
       }),
@@ -202,7 +225,7 @@ export function buildSandboxToolSet(
     },
     flattenMovie: {
       description:
-        'Movie only — AUTOMATIC: pull every video AND subtitle file out of the resource wrapper(s) up into the movie directory and remove the wrappers, in one call (no file selection — a movie is one film, take it all, subtitles included). Then delete any extras (trailers/花絮) with deleteFiles and markObtained(["MOVIE"]).',
+        'Movie only — AUTOMATIC: pull every video AND subtitle file out of the resource wrapper(s) up into the movie directory and remove the wrappers, in one call (subtitles included). Then delete any extras (trailers/花絮) and any redundant quality/resolution copies of the same movie (keep ONLY the single version best matching the user\'s quality preference) with deleteFiles, and markObtained(["MOVIE"]).',
       inputSchema: z.object({}),
       execute: () => asEvidence(() => sandbox.flattenMovie()),
     },
@@ -344,8 +367,16 @@ export interface AcquisitionAgentRequest {
   subtitle?: boolean;
   /** The run's drive brand — selects the brand-specific dead-links skill section. */
   storageProvider?: string;
+  /** Ordered active drives when running in unified multi-drive mode. */
+  drives?: readonly PromptDriveSummary[];
+  /** Primary storageId (e.g. an ongoing show's home drive). */
+  primaryStorageId?: string | null;
   /** Leftover staging: the tool set has no search or transfer tools. */
   stagingRecovery?: boolean;
+  /** Web-reference tools (alternate titles, fan-season ↔ TMDB episode mapping).
+   *  Requires the user's LLM endpoint so web search can route (DeepSeek's own
+   *  engine when configured, anonymous otherwise). Absent = no web access. */
+  titleResearch?: TitleResearchConfig;
   /** Per-tool-call live progress for the activity page (cleaned activity + phase
    *  + raw name/args). Best-effort; absent in tests/headless. */
   onProgress?: (event: AgentToolEvent) => void;
@@ -376,7 +407,10 @@ export async function runAcquisitionAgent(
     movie: request.movie ?? false,
     ...(request.subtitle ? { subtitle: true } : {}),
     ...(request.stagingRecovery ? { stagingRecovery: true } : {}),
+    ...(request.titleResearch === undefined ? {} : { titleResearch: request.titleResearch }),
     ...(request.storageProvider === undefined ? {} : { storageProvider: request.storageProvider }),
+    ...(request.drives === undefined ? {} : { drives: request.drives }),
+    ...(request.primaryStorageId === undefined ? {} : { primaryStorageId: request.primaryStorageId }),
     ...(onProgress
       ? {
           onToolCall: (toolName: string, args: Record<string, unknown>) =>

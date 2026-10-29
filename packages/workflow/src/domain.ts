@@ -79,7 +79,7 @@ export type WorkflowStatus =
    *  releases, but NOT queued/running — the worker never claims it and it is not an
    *  "active" run (see isActiveWorkflowStatus). The air-time gate runs the agent. */
   | "reserved";
-export type ResourceType = "115" | "magnet" | "manual" | "quark" | "tianyi" | "123" | "guangya";
+export type ResourceType = "115" | "magnet" | "manual" | "quark" | "uc" | "tianyi" | "123" | "guangya";
 export type TransferStatus = "succeeded" | "failed" | "no_target_change";
 export type Confidence = "low" | "medium" | "high";
 
@@ -367,6 +367,8 @@ export interface NotificationReport {
   fileCount?: number;
   totalBytes?: number;
   landingDir?: string;
+  /** Short drive labels where files landed during this run (e.g. ["115"] or ["115", "123"]). */
+  driveLabels?: string[];
 }
 
 export interface NotificationEvent {
@@ -379,6 +381,8 @@ export interface NotificationEvent {
   /** Absent on legacy/foreign-work events; generators set it going forward. */
   trigger?: NotificationTrigger;
   report?: NotificationReport;
+  /** Connected storage ID of the workflow run that generated this notification (populated on read). */
+  connectedStorageId?: string | null;
 }
 
 export function episodeCode(seasonNumber: number, episodeNumber: number): string {
@@ -553,4 +557,253 @@ export interface MovieWorkflowResult {
   notification: NotificationEvent;
   notifications: NotificationEvent[];
   auditEvents: AuditEvent[];
+}
+
+export interface DriveSpaceCacheEntry {
+  storageId: string;
+  totalBytes: number;
+  usedBytes: number;
+  probedAt: string;
+}
+
+/** One physical copy of an episode on a specific connected drive (`episode_copies`). */
+export interface EpisodeCopy {
+  trackedSeasonId: string;
+  episodeCode: string;
+  storageId: string;
+  fileIds: string[];
+  sizeBytes: number | null;
+  quality: string | null;
+  runId: string;
+  recordedAt: string;
+}
+
+/** Cross-drive union summary for one episode of a tracked season (C9). */
+export interface CrossDriveEpisodeOwnership {
+  episodeCode: string;
+  obtained: boolean;
+  metadataStatus: MetadataStatus;
+  drives: Array<{
+    storageId: string;
+    fileIds: string[];
+    sizeBytes: number | null;
+    quality: string | null;
+  }>;
+}
+
+/** 30-minute TTL for cached drive space numbers (`drive_space_cache`). */
+export const DRIVE_SPACE_CACHE_TTL_MS = 30 * 60 * 1000;
+
+/** Account-setting key storing the user's preferred drive order (JSON `string[]` of storageIds). */
+export const DRIVE_ORDER_SETTING_KEY = "drive_order";
+
+/** Order a list of drives by a user-configured `drive_order` array. Any drive not
+ *  named in `order` keeps its relative `createdAt` (connection-order) position after
+ *  the ordered ones. Pure & deterministic. */
+export function sortDrivesByOrder<T extends { id: string; createdAt?: string }>(
+  drives: readonly T[],
+  order: readonly string[] | null | undefined,
+): T[] {
+  const rank = new Map<string, number>();
+  order?.forEach((id, idx) => {
+    if (typeof id === "string" && id && !rank.has(id)) {
+      rank.set(id, idx);
+    }
+  });
+  return [...drives].sort((a, b) => {
+    const rA = rank.get(a.id);
+    const rB = rank.get(b.id);
+    if (rA !== undefined && rB !== undefined) return rA - rB;
+    if (rA !== undefined) return -1;
+    if (rB !== undefined) return 1;
+    if (a.createdAt && b.createdAt && a.createdAt !== b.createdAt) {
+      return a.createdAt.localeCompare(b.createdAt);
+    }
+    return 0;
+  });
+}
+
+/** Format drive space into a concise human-readable Chinese string for settings cards
+ *  and agent context. Negative remaining bytes (over-quota) are preserved explicitly,
+ *  never clamped to zero. */
+export function formatDriveSpaceSummary(
+  space: { totalBytes: number; usedBytes: number } | null | undefined,
+): {
+  remainingBytes: number | null;
+  overQuota: boolean;
+  badgeText: string;
+  agentText: string;
+} {
+  if (!space || !Number.isFinite(space.totalBytes) || !Number.isFinite(space.usedBytes) || space.totalBytes <= 0) {
+    return {
+      remainingBytes: null,
+      overQuota: false,
+      badgeText: "容量未知",
+      agentText: "容量未知",
+    };
+  }
+  const remainingBytes = space.totalBytes - space.usedBytes;
+  const overQuota = remainingBytes <= 0;
+  if (overQuota) {
+    const exceededLabel = formatByteSize(Math.abs(remainingBytes));
+    return {
+      remainingBytes,
+      overQuota: true,
+      badgeText: remainingBytes < 0
+        ? `已超额 ${exceededLabel}（共 ${formatByteSize(space.totalBytes)}）`
+        : `空间已满（共 ${formatByteSize(space.totalBytes)}）`,
+      agentText: remainingBytes < 0
+        ? `已超配额 ${exceededLabel}（总额 ${formatByteSize(space.totalBytes)}，已用 ${formatByteSize(space.usedBytes)}）— 禁止写入`
+        : `剩余 0 B（已满）— 禁止写入`,
+    };
+  }
+  return {
+    remainingBytes,
+    overQuota: false,
+    badgeText: `剩余 ${formatByteSize(remainingBytes)} / ${formatByteSize(space.totalBytes)}`,
+    agentText: `剩余 ${formatByteSize(remainingBytes)}（总额 ${formatByteSize(space.totalBytes)}）`,
+  };
+}
+
+/** Strict finite number coercion for JSON API responses: accepts only finite
+ *  numbers or non-empty numeric strings (rejects null, booleans, "", whitespace). */
+export function parseFiniteMetric(value: unknown): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : Number.NaN;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  }
+  return Number.NaN;
+}
+
+export function formatByteSize(bytes: number): string {
+  const abs = Math.abs(bytes);
+  const sign = bytes < 0 ? "-" : "";
+  const TB = 1024 ** 4;
+  const GB = 1024 ** 3;
+  const MB = 1024 ** 2;
+  if (abs >= TB) {
+    return `${sign}${(abs / TB).toFixed(2)} TB`;
+  }
+  if (abs >= GB) {
+    return `${sign}${(abs / GB).toFixed(1)} GB`;
+  }
+  if (abs >= MB) {
+    return `${sign}${(abs / MB).toFixed(1)} MB`;
+  }
+  return `${sign}${Math.round(abs)} B`;
+}
+
+/** Compare episode codes numerically by (season, episode) when possible,
+ *  falling back to lexicographic comparison for non-standard codes. */
+export function compareEpisodeCodes(a: string, b: string): number {
+  const mA = /^S(\d+)E(\d+)$/.exec(a);
+  const mB = /^S(\d+)E(\d+)$/.exec(b);
+  if (mA && mB) {
+    const sDiff = Number(mA[1]) - Number(mB[1]);
+    if (sDiff !== 0) return sDiff;
+    return Number(mA[2]) - Number(mB[2]);
+  }
+  return a.localeCompare(b);
+}
+
+/** Build the cross-drive union of episode ownership from per-drive episode_states
+ *  buckets and `episode_copies` rows.
+ *  - `episode_states` is authoritative for drives that have a tracked bucket for
+ *    this season under the account: an episode is obtained on that drive iff
+ *    `ep.obtained === true`.
+ *  - `episode_copies` provides `fileIds`, `sizeBytes`, and `quality` for those
+ *    obtained episodes, and also contributes obtained episodes on drives owned by
+ *    the account that do not have a separate `episode_states` bucket (unless the
+ *    season was untracked across all buckets). */
+export function buildCrossDriveEpisodeOwnership(input: {
+  driveEpisodeBuckets: ReadonlyArray<{
+    storageId: string;
+    episodes: readonly EpisodeState[];
+  }>;
+  copies: readonly EpisodeCopy[];
+  ownedStorageIds?: ReadonlySet<string>;
+  unscopedStorageSentinel?: string;
+}): CrossDriveEpisodeOwnership[] {
+  const unscoped = input.unscopedStorageSentinel ?? "";
+  const copyByEpisodeAndDrive = new Map<string, EpisodeCopy>();
+  for (const c of input.copies) {
+    copyByEpisodeAndDrive.set(`${c.episodeCode}::${c.storageId}`, c);
+  }
+
+  const byEpisode = new Map<string, CrossDriveEpisodeOwnership>();
+  const bucketsSeen = new Set<string>();
+
+  for (const bucket of input.driveEpisodeBuckets) {
+    bucketsSeen.add(bucket.storageId);
+    for (const ep of bucket.episodes) {
+      let entry = byEpisode.get(ep.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: ep.episodeCode,
+          obtained: false,
+          metadataStatus: ep.metadataStatus,
+          drives: [],
+        };
+        byEpisode.set(ep.episodeCode, entry);
+      }
+      if (ep.obtained) {
+        entry.obtained = true;
+        if (ep.metadataStatus === "provider_ahead") {
+          entry.metadataStatus = "provider_ahead";
+        }
+        if (bucket.storageId && bucket.storageId !== unscoped) {
+          const copy = copyByEpisodeAndDrive.get(`${ep.episodeCode}::${bucket.storageId}`);
+          if (!entry.drives.some((d) => d.storageId === bucket.storageId)) {
+            entry.drives.push({
+              storageId: bucket.storageId,
+              fileIds: copy && copy.fileIds.length > 0 ? [...copy.fileIds] : [...ep.verifiedFileIds],
+              sizeBytes: copy?.sizeBytes ?? null,
+              quality: copy?.quality ?? null,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Only fold in episode_copies from drives that do NOT have an authoritative
+  // episode_states bucket (or when no bucket listed that drive) AND belong to
+  // the account, provided the season has at least one tracked bucket for the account.
+  if (input.driveEpisodeBuckets.length > 0) {
+    for (const c of input.copies) {
+      if (input.ownedStorageIds && !input.ownedStorageIds.has(c.storageId)) {
+        continue;
+      }
+      if (bucketsSeen.has(c.storageId)) {
+        // Authoritative bucket already processed above: if ep.obtained was false
+        // in that drive's episode_states, do NOT resurrect it from episode_copies.
+        continue;
+      }
+      let entry = byEpisode.get(c.episodeCode);
+      if (!entry) {
+        entry = {
+          episodeCode: c.episodeCode,
+          obtained: true,
+          metadataStatus: "confirmed",
+          drives: [],
+        };
+        byEpisode.set(c.episodeCode, entry);
+      } else {
+        entry.obtained = true;
+      }
+      if (!entry.drives.some((d) => d.storageId === c.storageId)) {
+        entry.drives.push({
+          storageId: c.storageId,
+          fileIds: [...c.fileIds],
+          sizeBytes: c.sizeBytes,
+          quality: c.quality,
+        });
+      }
+    }
+  }
+
+  return [...byEpisode.values()].sort((a, b) => compareEpisodeCodes(a.episodeCode, b.episodeCode));
 }

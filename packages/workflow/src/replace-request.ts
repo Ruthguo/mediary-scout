@@ -1,10 +1,12 @@
 import type { LanguageModel } from "ai";
-import type { TrackedSeasonState, WorkflowRepository } from "./repository.js";
+import type { QueueClaimOptions, TrackedSeasonState, WorkflowRepository } from "./repository.js";
+import { claimNextQueuedRun } from "./repository.js";
 import type { AuditEvent, EpisodeState, TrackedSeason } from "./domain.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
-import type { ResourceProvider, StorageExecutor } from "./ports.js";
+import type { AcquisitionDriveContext, ResourceProvider, StorageExecutor } from "./ports.js";
 import type { JevJudge } from "./jev-judge.js";
 import type { RunAcquisitionV2Request, RunAcquisitionV2Result } from "./acquisition-v2/orchestrator.js";
+import type { TitleResearchOptions } from "./acquisition-v2/title-research.js";
 import { resourceLinkKey } from "./acquisition-v2/resource-link.js";
 import {
   parseSizeFromTitle,
@@ -23,6 +25,7 @@ import {
   resolveWorkerDeps,
   storageParentForTitle,
   type AccountWorkerContext,
+  type MayStartRun,
   type QueuedType2WorkerResult,
   type ResolveAccountWorkerContext,
   type SeasonMetadataSync,
@@ -194,11 +197,15 @@ export async function runQueuedReplaceRequest(
     now?: () => string;
     resolveAccountContext?: ResolveAccountWorkerContext;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
+    /** The worker's drive filter and claim callback when queued runs go side by side. */
+    claim?: QueueClaimOptions;
   },
 ): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
   const repository = input.repository;
-  const claimed = await repository.claimNextQueuedWorkflowRun({ kind: "replace_request", now: now() });
+  if (input.mayStartRun && !input.mayStartRun()) return { status: "idle" };
+  const claimed = await claimNextQueuedRun(repository, "replace_request", now(), input.claim);
   if (!claimed) return { status: "idle" };
   const runId = claimed.workflowRun.id;
   const work: UserMessageScope = {
@@ -217,6 +224,9 @@ export async function runQueuedReplaceRequest(
   /** A TV message this run carries names no (in-scope) episode: its episodes are read
    *  from the words, so the reply says whether any came out (see UserMessageReply.unidentified). */
   let untaggedTvMessage = false;
+  // The config of the model this run ENDED UP using (per-account resolver may
+  // override the base) — captured for the failure handler's free-tier copy.
+  let resolvedLlmConfig: { baseURL?: string; modelId?: string } | undefined;
   try {
     messages = await repository.claimUserMessages({ ...work, runId, now: now() });
     const states = await workStates(repository, work);
@@ -287,12 +297,33 @@ export async function runQueuedReplaceRequest(
       // A file's own link, from the transfer that landed it: the only link a file an
       // ordinary run landed has (no episode source is recorded for it).
       landingLinkKeys: async (fileIds) => {
+        const rawIds: string[] = [];
+        const rawToScoped = new Map<string, string[]>();
+        for (const fid of fileIds) {
+          const sep = fid.indexOf("::");
+          const storageId = sep > 0 ? fid.slice(0, sep) : null;
+          const raw = sep > 0 ? fid.slice(sep + 2) : fid;
+          if (storageId === null || storageId === work.drive) {
+            rawIds.push(raw);
+            const list = rawToScoped.get(raw) ?? [];
+            list.push(fid);
+            rawToScoped.set(raw, list);
+          }
+        }
         const keys = new Map<string, string | null>();
-        for (const s of await repository.listLandingSources({ accountId: work.accountId, drive: work.drive, fileIds })) {
+        for (const s of await repository.listLandingSources({
+          accountId: work.accountId,
+          drive: work.drive,
+          fileIds: [...new Set([...fileIds, ...rawIds])],
+        })) {
           // The oldest transfer decides — a later one can only have claimed the file through
           // a lagging listing — even when its link is unusable or has no key (null, not left
           // out: the file has a source of its own, so the episode's recorded one is not lent).
-          if (!keys.has(s.fileId)) keys.set(s.fileId, s.url === null ? null : resourceLinkKey(s.url));
+          const linkVal = s.url === null ? null : resourceLinkKey(s.url);
+          if (!keys.has(s.fileId)) keys.set(s.fileId, linkVal);
+          for (const scoped of rawToScoped.get(s.fileId) ?? []) {
+            if (!keys.has(scoped)) keys.set(scoped, linkVal);
+          }
         }
         return Object.fromEntries(keys);
       },
@@ -324,6 +355,7 @@ export async function runQueuedReplaceRequest(
       routineIfNothingReplaced: messages.length === 0,
     };
     const deps = await resolveWorkerDeps(input.resolveAccountContext, claimed.accountId, claimed.connectedStorageId, input);
+    resolvedLlmConfig = deps.llmConfig;
     const common = {
       resourceProvider: deps.resourceProvider,
       storage: deps.storage,
@@ -401,6 +433,7 @@ export async function runQueuedReplaceRequest(
         // success path (see stampReplaceNotification / the `notice.trigger` above); a user
         // request keeps its individual "user" push.
         notificationTrigger: queuedBy(claimed.workflowRun.auditEvents) === "patrol" ? "scheduled" : "user",
+        ...(resolvedLlmConfig === undefined ? {} : { llmConfig: resolvedLlmConfig }),
         ...(input.onAuthErrorFreeze === undefined ? {} : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
       });
       requeued = handled.status === "auto_requeued";
@@ -609,6 +642,8 @@ function optionalDeps(deps: Awaited<ReturnType<typeof resolveWorkerDeps>>): {
   assrtToken?: string;
   jevJudge?: JevJudge;
   agentMemory?: boolean;
+  titleResearch?: TitleResearchOptions;
+  drives?: AcquisitionDriveContext[];
 } {
   return {
     ...(deps.preferredLanguage === undefined ? {} : { preferredLanguage: deps.preferredLanguage }),
@@ -617,5 +652,9 @@ function optionalDeps(deps: Awaited<ReturnType<typeof resolveWorkerDeps>>): {
     ...(deps.assrtToken === undefined ? {} : { assrtToken: deps.assrtToken }),
     ...(deps.jevJudge === undefined ? {} : { jevJudge: deps.jevJudge }),
     ...(deps.agentMemory === undefined ? {} : { agentMemory: deps.agentMemory }),
+    // A replacement run searches and transfers like any other — without this the
+    // configured web tools (and the fan-season mapping prompt) silently vanish.
+    ...(deps.titleResearch === undefined ? {} : { titleResearch: deps.titleResearch }),
+    ...(deps.drives === undefined ? {} : { drives: deps.drives }),
   };
 }
